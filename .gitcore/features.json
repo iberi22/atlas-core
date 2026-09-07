@@ -6,10 +6,10 @@
    "id": "feat-dag-store",
    "last_tested": "2026-09-07",
    "name": "Task DAG store",
-   "notes": "DoD: schema migration + 100k-node traversal benchmark <100ms. | Promoted 2026-09-07 by green runs.",
-   "passes": true,
-   "progress_pct": 100,
-   "status": "stable"
+   "notes": "Review 2026-09-07: PARCIAL. p99<100ms DoD not measured (test asserts <5s). REQ-F-006 open.",
+   "passes": false,
+   "progress_pct": 85,
+   "status": "planned"
   },
   "feat-dispatcher": {
    "category": "core",
@@ -39,10 +39,10 @@
    "id": "feat-forge-min",
    "last_tested": "2026-09-07",
    "name": "Minimal agent forge",
-   "notes": "DoD: issue->PR->fast-CI->main loop without touching GitHub UI. | Promoted 2026-09-07 by green runs.",
-   "passes": true,
-   "progress_pct": 100,
-   "status": "stable"
+   "notes": "Review 2026-09-07: PARCIAL. deploy prints plan only, no GitHub mirror. REQ-F-018 half.",
+   "passes": false,
+   "progress_pct": 70,
+   "status": "planned"
   },
   "feat-serve-local": {
    "category": "core",
@@ -61,10 +61,10 @@
    "id": "feat-verifier",
    "last_tested": "2026-09-07",
    "name": "Completion verifier",
-   "notes": "DoD: no task reaches COMPLETED by agent declaration alone. | Promoted 2026-09-07 by green runs.",
-   "passes": true,
-   "progress_pct": 100,
-   "status": "stable"
+   "notes": "Review 2026-09-07: PARCIAL. Rule gate real; LLM reviewer is StubReviewer. REQ-F-013 stub.",
+   "passes": false,
+   "progress_pct": 80,
+   "status": "planned"
   },
   "feat-wasm-node": {
    "category": "core",
@@ -72,10 +72,10 @@
    "id": "feat-wasm-node",
    "last_tested": "2026-09-07",
    "name": "WASM+Node deploy unit",
-   "notes": "DoD: same .wasm computes identical traversal in Node and in Workers. | Promoted 2026-09-07 by green runs.",
-   "passes": true,
-   "progress_pct": 100,
-   "status": "stable"
+   "notes": "Review 2026-09-07: PARCIAL. Parity+wasm32 build OK; no Node wrapper, no Node-side SQLite, no Workers evidence. REQ-F-021 missing.",
+   "passes": false,
+   "progress_pct": 70,
+   "status": "planned"
   },
   "feat-xavier-adapter": {
    "category": "integration",
