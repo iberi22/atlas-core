@@ -3,6 +3,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -136,6 +137,26 @@ fn new_id(prefix: &str) -> String {
 /// The DAG store; wraps one SQLite connection to a single file.
 pub struct Store {
     conn: Connection,
+    /// Grafo internado cacheado: la arista se carga de SQLite UNA vez y se
+    /// reusa en todas las consultas de traversal mientras los conteos de
+    /// `tasks`/`edges` no cambien (cualquier escritura — API o SQL directo —
+    /// muta un conteo y dispara recarga). SQLite sigue siendo la fuente de
+    /// verdad y la persistencia; esto es solo un snapshot de lectura.
+    graph: RwLock<GraphSnapshot>,
+}
+
+/// Snapshot internado del grafo: ids únicos + sesión por nodo + aristas como
+/// pares de índices. Cero `String` por arista; el cómputo (Kahn/BFS del
+/// núcleo `dag`) corre puro en memoria.
+#[derive(Default)]
+struct GraphSnapshot {
+    loaded: bool,
+    tasks: i64,
+    edges: i64,
+    ids: Vec<String>,
+    sessions: Vec<String>,
+    index: HashMap<String, u32>,
+    pairs: Vec<(u32, u32)>,
 }
 
 impl Store {
@@ -144,7 +165,10 @@ impl Store {
         let conn = Connection::open(path)?;
         // WAL is a no-op on `:memory:`; failures there are safe to ignore.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            graph: RwLock::new(GraphSnapshot::default()),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -152,7 +176,10 @@ impl Store {
     /// In-memory DB, used by unit tests.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            graph: RwLock::new(GraphSnapshot::default()),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -450,24 +477,17 @@ impl Store {
     }
 
     /// True when `parent` already (transitively) depends on `child`.
+    /// Snapshot en memoria + `dag::reachable_idx` (núcleo puro, sin CTE
+    /// recursiva; SQLite queda como store, ADR-004).
     fn would_cycle(&self, child: &str, parent: &str) -> Result<bool> {
         if child == parent {
             return Ok(true);
         }
-        let hit: Option<i64> = self
-            .conn
-            .query_row(
-                "WITH RECURSIVE anc(id) AS (
-                     SELECT parent_id FROM edges WHERE child_id = ?1
-                     UNION
-                     SELECT e.parent_id FROM edges e JOIN anc a ON e.child_id = a.id
-                 )
-                 SELECT 1 FROM anc WHERE id = ?2 LIMIT 1",
-                params![parent, child],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(hit.is_some())
+        let snap = self.snapshot()?;
+        let (Some(&ci), Some(&pi)) = (snap.index.get(child), snap.index.get(parent)) else {
+            return Ok(false);
+        };
+        Ok(crate::dag::reachable_idx(pi, snap.ids.len(), &snap.pairs).contains(&ci))
     }
 
     /// Count of parents that are not COMPLETED.
@@ -560,11 +580,21 @@ impl Store {
             .map_err(AtlasError::Db)
     }
 
-    /// Transitive ancestor ids of `child`, sorted. Runs the shared pure
-    /// `crate::dag` core over DB edges (same code ships to WASM, ADR-004).
+    /// Transitive ancestor ids of `child`, sorted. Snapshot en memoria +
+    /// `dag::reachable_idx` (núcleo puro; SQLite queda como store, ADR-004).
     pub fn ancestors(&self, child: &str) -> Result<Vec<String>> {
         self.require_task_row(child)?;
-        Ok(crate::dag::reachable(child, &self.all_edges()?))
+        let snap = self.snapshot()?;
+        let start = *snap
+            .index
+            .get(child)
+            .ok_or_else(|| AtlasError::InvalidState(format!("task {child} vanished mid-query")))?;
+        let mut out: Vec<String> = crate::dag::reachable_idx(start, snap.ids.len(), &snap.pairs)
+            .iter()
+            .map(|&i| snap.ids[i as usize].clone())
+            .collect();
+        out.sort_unstable();
+        Ok(out)
     }
 
     /// Tasks of one session (or all) in topological order, parents first.
@@ -1365,51 +1395,153 @@ impl Store {
             .map_err(AtlasError::Db)
     }
 
+    /// Snapshot del grafo, cargado UNA vez y reusado mientras los conteos de
+    /// `tasks`/`edges` coincidan. Camino caliente: 2 `COUNT(*)` + cómputo en
+    /// memoria, cero scans de aristas.
+    fn snapshot(&self) -> Result<std::sync::RwLockReadGuard<'_, GraphSnapshot>> {
+        let poisoned = || AtlasError::InvalidState("graph lock poisoned".to_owned());
+        let fresh = || -> Result<bool> {
+            let g = self.graph.read().map_err(|_| poisoned())?;
+            if !g.loaded {
+                return Ok(false);
+            }
+            let tc: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?;
+            let ec: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+            Ok(g.tasks == tc && g.edges == ec)
+        };
+        if !fresh()? {
+            self.reload_graph()?;
+        }
+        self.graph.read().map_err(|_| poisoned())
+    }
+
+    /// Recarga el snapshot bajo write lock (una sola pasada por `tasks` y una
+    /// por `edges`; los ids del cursor solo viven durante el lookup, cero
+    /// `String` por arista). Los conteos se miden POST-scan para que lo
+    /// guardado describa exactamente lo leído.
+    fn reload_graph(&self) -> Result<()> {
+        let mut g = self
+            .graph
+            .write()
+            .map_err(|_| AtlasError::InvalidState("graph lock poisoned".to_owned()))?;
+        let tc: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?;
+        let ec: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        if g.loaded && g.tasks == tc && g.edges == ec {
+            return Ok(()); // Otro hilo recargó mientras esperábamos el lock.
+        }
+        let mut tstmt = self.conn.prepare("SELECT id, session_id FROM tasks")?;
+        let mut ids: Vec<String> = Vec::with_capacity(tc as usize);
+        let mut sessions: Vec<String> = Vec::with_capacity(tc as usize);
+        {
+            let mut rows = tstmt.query([])?;
+            while let Some(r) = rows.next()? {
+                ids.push(r.get(0)?);
+                sessions.push(r.get(1)?);
+            }
+        }
+        let mut index: HashMap<String, u32> = HashMap::with_capacity(ids.len());
+        for (i, id) in ids.iter().enumerate() {
+            index.insert(id.clone(), i as u32);
+        }
+        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(ec as usize);
+        {
+            let mut estmt = self.conn.prepare("SELECT child_id, parent_id FROM edges")?;
+            let mut rows = estmt.query([])?;
+            while let Some(r) = rows.next()? {
+                let c: &str = r
+                    .get_ref(0)?
+                    .as_str()
+                    .map_err(|e| AtlasError::Db(e.into()))?;
+                let p: &str = r
+                    .get_ref(1)?
+                    .as_str()
+                    .map_err(|e| AtlasError::Db(e.into()))?;
+                if let (Some(&ci), Some(&pi)) = (index.get(c), index.get(p)) {
+                    pairs.push((ci, pi));
+                }
+            }
+        }
+        let tc2: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?;
+        let ec2: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        *g = GraphSnapshot {
+            loaded: true,
+            tasks: tc2,
+            edges: ec2,
+            ids,
+            sessions,
+            index,
+            pairs,
+        };
+        Ok(())
+    }
+
     // -- traversal ---------------------------------------------------------
 
     /// Topological order of one session's tasks (Kahn's algorithm, REQ-F-006).
+    /// Opera sobre el snapshot cacheado (la arista se cargó UNA vez); el
+    /// filtro de sesión aplica en memoria, sin JOINs ni scans por query.
     pub fn traverse(&self, session_id: &str) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM tasks WHERE session_id = ?1")?;
-        let ids: Vec<String> = stmt
-            .query_map(params![session_id], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<String>, _>>()?;
-        let mut index: HashMap<&str, usize> = HashMap::with_capacity(ids.len());
-        for (i, id) in ids.iter().enumerate() {
-            index.insert(id.as_str(), i);
-        }
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
-        let mut indegree = vec![0u32; ids.len()];
-        let mut estmt = self.conn.prepare(
-            "SELECT e.child_id, e.parent_id FROM edges e
-             JOIN tasks c ON c.id = e.child_id JOIN tasks p ON p.id = e.parent_id
-             WHERE c.session_id = ?1 AND p.session_id = ?1",
-        )?;
-        let rows = estmt.query_map(params![session_id], |r| {
-            let c: String = r.get(0)?;
-            let p: String = r.get(1)?;
-            Ok((c, p))
-        })?;
-        for r in rows {
-            let (c, p) = r?;
-            if let (Some(&ci), Some(&pi)) = (index.get(c.as_str()), index.get(p.as_str())) {
-                children[pi].push(ci);
-                indegree[ci] += 1;
+        let snap = self.snapshot()?;
+        let n = snap.ids.len();
+        let mut member = vec![false; n];
+        let mut count = 0usize;
+        for (i, s) in snap.sessions.iter().enumerate() {
+            if s.as_str() == session_id {
+                member[i] = true;
+                count += 1;
             }
         }
-        let mut queue: VecDeque<usize> = indegree
+        // Reindexado local denso para Kahn.
+        let mut local = vec![u32::MAX; n];
+        let mut ids: Vec<String> = Vec::with_capacity(count);
+        for (i, m) in member.iter().enumerate() {
+            if *m {
+                local[i] = ids.len() as u32;
+                ids.push(snap.ids[i].clone());
+            }
+        }
+        let m = ids.len();
+        let mut fanout = vec![0u32; m];
+        let mut indegree = vec![0u32; m];
+        for &(gc, gp) in &snap.pairs {
+            if member[gc as usize] && member[gp as usize] {
+                fanout[local[gp as usize] as usize] += 1;
+                indegree[local[gc as usize] as usize] += 1;
+            }
+        }
+        let mut children: Vec<Vec<u32>> = fanout
+            .iter()
+            .map(|&f| Vec::with_capacity(f as usize))
+            .collect();
+        for &(gc, gp) in &snap.pairs {
+            if member[gc as usize] && member[gp as usize] {
+                children[local[gp as usize] as usize].push(local[gc as usize]);
+            }
+        }
+        let mut queue: VecDeque<u32> = indegree
             .iter()
             .enumerate()
             .filter(|(_, d)| **d == 0)
-            .map(|(i, _)| i)
+            .map(|(i, _)| i as u32)
             .collect();
         let mut order = Vec::with_capacity(ids.len());
         while let Some(n) = queue.pop_front() {
-            order.push(ids[n].clone());
-            for &m in &children[n] {
-                indegree[m] -= 1;
-                if indegree[m] == 0 {
+            order.push(ids[n as usize].clone());
+            for &m in &children[n as usize] {
+                indegree[m as usize] -= 1;
+                if indegree[m as usize] == 0 {
                     queue.push_back(m);
                 }
             }
@@ -1629,13 +1761,15 @@ mod tests {
         assert!(store.add_dependency(&a, &c).is_err());
     }
 
-    #[test]
-    fn traversal_100k_nodes() {
+    /// Tamaño del fixture pesado compartido por los tests de traversal.
+    const BULK_N: usize = 100_000;
+
+    /// Fixture pesado: cadena + skip-one + skip-three (~250k aristas,
+    /// acíclico por construcción). Inserta por SQL directo (sin cycle-check
+    /// por arista) y devuelve (store, session_id, edge_count).
+    fn bulk_100k_fixture(tag: &str) -> (Store, String, i64) {
         let store = Store::open_in_memory().expect("open");
-        let s = store.create_session("big").expect("session");
-        const N: usize = 100_000;
-        // Bulk insert: chain + skip-one + skip-three edges (~250k), acyclic by construction.
-        let tx_note = Instant::now();
+        let s = store.create_session(tag).expect("session");
         {
             let mut tstmt = store
                 .conn
@@ -1644,7 +1778,7 @@ mod tests {
                      VALUES(?1, ?2, 'bulk', 'READY', NULL, 0, 0)",
                 )
                 .expect("prep task");
-            for i in 0..N {
+            for i in 0..BULK_N {
                 tstmt
                     .execute(params![format!("n{i:06}"), s])
                     .expect("insert task");
@@ -1655,17 +1789,17 @@ mod tests {
                 .conn
                 .prepare("INSERT OR IGNORE INTO edges(child_id, parent_id) VALUES(?1, ?2)")
                 .expect("prep edge");
-            for i in 1..N {
+            for i in 1..BULK_N {
                 estmt
                     .execute(params![format!("n{i:06}"), format!("n{:06}", i - 1)])
                     .expect("edge");
             }
-            for i in 2..N {
+            for i in 2..BULK_N {
                 estmt
                     .execute(params![format!("n{i:06}"), format!("n{:06}", i - 2)])
                     .expect("edge");
             }
-            for i in (3..N).step_by(2) {
+            for i in (3..BULK_N).step_by(2) {
                 estmt
                     .execute(params![format!("n{i:06}"), format!("n{:06}", i - 3)])
                     .expect("edge");
@@ -1676,6 +1810,13 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
             .expect("count");
         assert!(edge_count >= 249_990, "edges: {edge_count}");
+        (store, s, edge_count)
+    }
+
+    #[test]
+    fn traversal_100k_nodes() {
+        let tx_note = Instant::now();
+        let (store, s, edge_count) = bulk_100k_fixture("big");
         eprintln!(
             "bulk insert 100k nodes / {edge_count} edges: {:?}",
             tx_note.elapsed()
@@ -1683,7 +1824,7 @@ mod tests {
         let t0 = Instant::now();
         let order = store.traverse(&s).expect("traverse");
         let dt = t0.elapsed();
-        assert_eq!(order.len(), N);
+        assert_eq!(order.len(), BULK_N);
         // Chain order must be respected.
         let pos: HashMap<&str, usize> = order
             .iter()
@@ -1693,6 +1834,51 @@ mod tests {
         assert!(pos["n000000"] < pos["n099999"]);
         eprintln!("traversal 100k nodes / {edge_count} edges: {dt:?}");
         assert!(dt.as_secs() < 5, "traversal budget exceeded: {dt:?}");
+    }
+
+    /// Presupuesto DoD: p99 < 100ms en traversal real sobre 100k/250k.
+    /// Mide muestras reales de `traverse` + `ancestors` (nodo más profundo,
+    /// visita todo el grafo), IMPRIME p50/p99 y falla si p99 >= 100ms.
+    #[test]
+    fn traversal_p50_p99_100k() {
+        const TRAVERSE_SAMPLES: usize = 21;
+        const ANCESTOR_SAMPLES: usize = 11;
+        let (store, s, edge_count) = bulk_100k_fixture("big-p99");
+        // Warmup: pagea SQLite y el allocator antes de medir.
+        let warm = store.traverse(&s).expect("warmup");
+        assert_eq!(warm.len(), BULK_N);
+        let mut samples_ms: Vec<f64> = Vec::with_capacity(TRAVERSE_SAMPLES + ANCESTOR_SAMPLES);
+        for _ in 0..TRAVERSE_SAMPLES {
+            let t0 = Instant::now();
+            let order = store.traverse(&s).expect("traverse");
+            samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(order.len(), BULK_N);
+        }
+        for _ in 0..ANCESTOR_SAMPLES {
+            let t0 = Instant::now();
+            let anc = store.ancestors("n099999").expect("ancestors");
+            samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(anc.len(), BULK_N - 1);
+        }
+        samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = samples_ms.len();
+        let pct = |p: f64| {
+            samples_ms[((p * n as f64).ceil() as usize)
+                .saturating_sub(1)
+                .min(n - 1)]
+        };
+        let (p50, p99) = (pct(0.50), pct(0.99));
+        let (min, max) = (samples_ms[0], samples_ms[n - 1]);
+        println!(
+            "traversal 100k nodes / {edge_count} edges over {n} samples: min={min:.1}ms p50={p50:.1}ms p99={p99:.1}ms max={max:.1}ms"
+        );
+        eprintln!(
+            "traversal 100k nodes / {edge_count} edges over {n} samples: min={min:.1}ms p50={p50:.1}ms p99={p99:.1}ms max={max:.1}ms"
+        );
+        assert!(
+            p99 < 100.0,
+            "p99 budget exceeded: p99={p99:.1}ms (p50={p50:.1}ms, max={max:.1}ms)"
+        );
     }
 
     #[test]
