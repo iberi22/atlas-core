@@ -483,6 +483,40 @@ impl Store {
             .map_err(AtlasError::Db)
     }
 
+    /// Every `(child, parent)` edge in the DB (ATLAS-04: feeds `dag` core).
+    pub fn all_edges(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT child_id, parent_id FROM edges")?;
+        let rows = stmt.query_map([], |r| {
+            let child: String = r.get(0)?;
+            let parent: String = r.get(1)?;
+            Ok((child, parent))
+        })?;
+        rows.collect::<std::result::Result<Vec<(String, String)>, _>>()
+            .map_err(AtlasError::Db)
+    }
+
+    /// Transitive ancestor ids of `child`, sorted. Runs the shared pure
+    /// `crate::dag` core over DB edges (same code ships to WASM, ADR-004).
+    pub fn ancestors(&self, child: &str) -> Result<Vec<String>> {
+        self.require_task_row(child)?;
+        Ok(crate::dag::reachable(child, &self.all_edges()?))
+    }
+
+    /// Tasks of one session (or all) in topological order, parents first.
+    /// Cycle here is unreachable via the API (edges are cycle-checked on
+    /// insert) but surfaces as `InvalidState` for DBs edited by hand.
+    pub fn topo_sorted(&self, session: Option<&str>) -> Result<Vec<Task>> {
+        let tasks = self.list_tasks(session)?;
+        let nodes: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        let order = crate::dag::topo_order(&nodes, &self.all_edges()?)
+            .map_err(|e| AtlasError::InvalidState(e.to_string()))?;
+        let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        Ok(order
+            .iter()
+            .filter_map(|id| by_id.get(id.as_str()).map(|t| (*t).clone()))
+            .collect())
+    }
+
     /// Count tasks per state for one session (used by `status`).
     pub fn counts_by_state(&self, session_id: &str) -> Result<HashMap<String, i64>> {
         let mut stmt = self
@@ -1149,6 +1183,29 @@ mod tests {
             now_secs()
         ));
         p
+    }
+
+    #[test]
+    fn dag_core_matches_db_traversal() {
+        // ATLAS-04: `ancestors`/`topo_sorted` run the shared `dag` core;
+        // order must respect dependencies (parents before children).
+        let store = Store::open_in_memory().expect("open");
+        let s = store.create_session("dag parity").expect("session");
+        let a = store.create_task(&s, "a", None, &[]).expect("a");
+        let b = store.create_task(&s, "b", None, &[&a]).expect("b");
+        let c = store.create_task(&s, "c", None, &[&b]).expect("c");
+        let mut want = vec![a.clone(), b.clone()];
+        want.sort();
+        assert_eq!(store.ancestors(&c).expect("anc"), want);
+        let ids: Vec<String> = store
+            .topo_sorted(Some(&s))
+            .expect("topo")
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        // Parents-first partial order (robust to generated-id collation).
+        let pos = |id: &str| ids.iter().position(|x| x == id).expect("present");
+        assert!(pos(&a) < pos(&b) && pos(&b) < pos(&c));
     }
 
     #[test]

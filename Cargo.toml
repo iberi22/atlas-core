@@ -3,6 +3,9 @@ name = "atlas"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [".", "wasm"]
+
 [[bin]]
 name = "atlas"
 path = "src/main.rs"

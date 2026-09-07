@@ -1,5 +1,6 @@
 // Atlas core library: SQLite task-DAG store plus record shapes.
 // The `atlas` binary (src/main.rs) is a thin CLI over this API (REQ-F-007).
+pub mod dag;
 mod error;
 pub mod model;
 pub mod store;
