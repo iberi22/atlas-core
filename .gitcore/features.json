@@ -39,10 +39,10 @@
    "id": "feat-forge-min",
    "last_tested": "2026-09-07",
    "name": "Minimal agent forge",
-   "notes": "Review 2026-09-07: PARCIAL. deploy prints plan only, no GitHub mirror. REQ-F-018 half.",
-   "passes": false,
-   "progress_pct": 70,
-   "status": "planned"
+   "notes": "Verified 2026-09-07: deploy --execute ships+rollback on fixture, gates live.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
   },
   "feat-serve-local": {
    "category": "core",
@@ -61,10 +61,10 @@
    "id": "feat-verifier",
    "last_tested": "2026-09-07",
    "name": "Completion verifier",
-   "notes": "Review 2026-09-07: PARCIAL. Rule gate real; LLM reviewer is StubReviewer. REQ-F-013 stub.",
-   "passes": false,
-   "progress_pct": 80,
-   "status": "planned"
+   "notes": "Verified 2026-09-07: CommandReviewer approve/reject/timeout + stub fallback, live cmd:approve.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
   },
   "feat-wasm-node": {
    "category": "core",
@@ -72,9 +72,9 @@
    "id": "feat-wasm-node",
    "last_tested": "2026-09-07",
    "name": "WASM+Node deploy unit",
-   "notes": "Review 2026-09-07: PARCIAL. Parity+wasm32 build OK; no Node wrapper, no Node-side SQLite, no Workers evidence. REQ-F-021 missing.",
+   "notes": "Review 2026-09-07: Node wrapper + package + CPanel guide exist (node --check OK); pending better-sqlite3 install on server + Workers evidence.",
    "passes": false,
-   "progress_pct": 70,
+   "progress_pct": 85,
    "status": "planned"
   },
   "feat-xavier-adapter": {
