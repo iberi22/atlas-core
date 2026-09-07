@@ -100,6 +100,19 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Serve the local dev dashboard: single-file HTML plus websocket
+    /// live updates (REQ-F-016). Loopback only unless `--public`.
+    Serve {
+        /// TCP port to listen on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Bind host (default loopback; other hosts need --public).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Allow non-loopback binds (never the default).
+        #[arg(long)]
+        public: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -470,6 +483,20 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Cmd::Serve { port, host, public } => {
+            let cfg = atlas::serve::ServeConfig {
+                host: host.clone(),
+                port: *port,
+                db: cli.db.clone(),
+                public: *public,
+            };
+            // Refuse non-loopback binds without --public before listening.
+            atlas::serve::resolve_bind(&cfg.host, cfg.port, cfg.public)
+                .map_err(anyhow::Error::new)?;
+            println!("serving dashboard on {}:{}", cfg.host, cfg.port);
+            atlas::serve::run_server(&cfg).map_err(anyhow::Error::new)?;
             Ok(())
         }
     }

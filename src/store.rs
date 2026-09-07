@@ -802,6 +802,18 @@ impl Store {
             })?)
     }
 
+    /// Latest events (newest first), capped at `limit`, for the
+    /// `atlas serve` history panel (REQ-F-016).
+    pub fn recent_events(&self, limit: i64) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, type, payload, idempotency_key, processed
+             FROM events ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], event_from_row)?;
+        rows.collect::<std::result::Result<Vec<Event>, _>>()
+            .map_err(AtlasError::Db)
+    }
+
     /// Current durable checkpoint, if any.
     pub fn checkpoint(&self) -> Result<Option<Checkpoint>> {
         Ok(self

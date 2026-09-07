@@ -4,6 +4,7 @@ pub mod dag;
 mod error;
 pub mod estimator;
 pub mod model;
+pub mod serve;
 pub mod store;
 pub mod verifier;
 

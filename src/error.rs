@@ -19,6 +19,9 @@ pub enum AtlasError {
     /// The requested state transition is not allowed.
     #[error("invalid transition: {0}")]
     InvalidTransition(String),
+    /// Local dashboard socket failure.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Store-level result alias.
