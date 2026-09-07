@@ -1,0 +1,304 @@
+// `atlas` CLI: sessions, task DAG, and tree render (REQ-F-003/005).
+use atlas::{Store, model, store};
+
+use anyhow::{Context, Result, anyhow};
+use clap::{Parser, Subcommand};
+use serde_json::json;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use atlas::model::TaskNode;
+
+/// Atlas: autonomous long-horizon task execution, offline-first.
+#[derive(Debug, Parser)]
+#[command(name = "atlas", version, about = "Task-DAG store + sessions")]
+struct Cli {
+    /// SQLite file (created on first use).
+    #[arg(long, global = true, default_value = "./atlas.db")]
+    db: PathBuf,
+    /// Machine-readable output.
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Start a new session for a goal.
+    Start {
+        #[arg(long)]
+        goal: String,
+    },
+    /// Stop a session (history is kept).
+    Stop {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Show a session with per-state task counts.
+    Status {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// List tasks, optionally filtered by session.
+    List {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Render the dependency tree of a session.
+    Tree {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Task operations.
+    #[command(subcommand)]
+    Task(TaskCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCmd {
+    /// Create a task, optionally depending on other task ids.
+    Create {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        depends_on: Vec<String>,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Manually block a task with a reason.
+    Block {
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Mark a task completed (unlocks ready dependents).
+    Complete { id: String },
+    /// Mark a task failed with a reason.
+    Fail {
+        id: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Move a READY task to IN_PROGRESS.
+    Start { id: String },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let store = Store::open(&cli.db)
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("cannot open DB {}", cli.db.display()))?;
+    run(&store, &cli)
+}
+
+fn run(store: &Store, cli: &Cli) -> Result<()> {
+    match &cli.cmd {
+        Cmd::Start { goal } => {
+            let id = store.create_session(goal).map_err(anyhow::Error::new)?;
+            let sess = store.get_session(&id).map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&sess)?);
+            } else {
+                println!("started session {} ({})", sess.id, sess.goal);
+            }
+            Ok(())
+        }
+        Cmd::Stop { session } => {
+            let s = resolve_session(store, session)?;
+            let updated = store
+                .set_session_status(&s, "stopped")
+                .map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&updated)?);
+            } else {
+                println!("stopped session {}", updated.id);
+            }
+            Ok(())
+        }
+        Cmd::Status { session } => {
+            let s = resolve_session(store, session)?;
+            let sess = store.get_session(&s).map_err(anyhow::Error::new)?;
+            let counts = store.counts_by_state(&s).map_err(anyhow::Error::new)?;
+            let tasks = store.list_tasks(Some(&s)).map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "session": sess,
+                        "counts": counts,
+                        "tasks": tasks,
+                    }))?
+                );
+            } else {
+                println!("session {} [{}]", sess.id, sess.status);
+                println!("goal: {}", sess.goal);
+                let mut states: Vec<_> = counts.iter().collect();
+                states.sort_by_key(|(k, _)| (*k).clone());
+                for (st, n) in states {
+                    println!("  {st}: {n}");
+                }
+                println!("tasks: {}", tasks.len());
+            }
+            Ok(())
+        }
+        Cmd::List { session } => {
+            let tasks = store
+                .list_tasks(session.as_deref())
+                .map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            } else {
+                for t in &tasks {
+                    println!("{} [{}] {}", t.id, t.state, t.title);
+                }
+            }
+            Ok(())
+        }
+        Cmd::Tree { session } => {
+            let s = resolve_session(store, session)?;
+            let roots = build_tree(store, &s).map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&roots)?);
+            } else {
+                for r in &roots {
+                    print_node(r, 0);
+                }
+            }
+            Ok(())
+        }
+        Cmd::Task(sub) => match sub {
+            TaskCmd::Create {
+                title,
+                session,
+                depends_on,
+                agent,
+            } => {
+                let s = resolve_session(store, session)?;
+                let deps: Vec<&str> = depends_on.iter().map(String::as_str).collect();
+                let id = store
+                    .create_task(&s, title, agent.as_deref(), &deps)
+                    .map_err(anyhow::Error::new)?;
+                let task = store.get_task(&id).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&task)?);
+                } else {
+                    println!("created {} [{}] {}", task.id, task.state, task.title);
+                }
+                Ok(())
+            }
+            TaskCmd::Block { id, reason } => {
+                let task = store.block_task(id, reason).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&task)?);
+                } else {
+                    println!("blocked {} ({})", task.id, reason);
+                }
+                Ok(())
+            }
+            TaskCmd::Complete { id } => {
+                let task = store.complete_task(id).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&task)?);
+                } else {
+                    println!("completed {}", task.id);
+                }
+                Ok(())
+            }
+            TaskCmd::Fail { id, reason } => {
+                let task = store.fail_task(id, reason).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&task)?);
+                } else {
+                    println!("failed {}", task.id);
+                }
+                Ok(())
+            }
+            TaskCmd::Start { id } => {
+                let task = store.start_task(id).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&task)?);
+                } else {
+                    println!("started {} [{}]", task.id, task.state);
+                }
+                Ok(())
+            }
+        },
+    }
+}
+
+/// Explicit `--session` or the most recent one.
+fn resolve_session(store: &Store, explicit: &Option<String>) -> Result<String> {
+    if let Some(s) = explicit {
+        return Ok(s.clone());
+    }
+    store
+        .latest_session()
+        .map_err(anyhow::Error::new)?
+        .map(|s| s.id)
+        .ok_or_else(|| anyhow!("no session yet; run `atlas start --goal \"...\"` first"))
+}
+
+/// Forest of task trees for a session (roots = tasks without parents).
+fn build_tree(store: &Store, session: &str) -> store::Result<Vec<TaskNode>> {
+    let tasks = store.list_tasks(Some(session))?;
+    let mut meta: HashMap<String, (String, model::TaskState)> = HashMap::with_capacity(tasks.len());
+    for t in &tasks {
+        meta.insert(t.id.clone(), (t.title.clone(), t.state));
+    }
+    let mut child_ids: HashMap<String, Vec<String>> = HashMap::new();
+    let mut roots: Vec<String> = Vec::new();
+    for t in &tasks {
+        let parents = store.parents_of(&t.id)?;
+        if parents.is_empty() {
+            roots.push(t.id.clone());
+        }
+        for par in parents {
+            if meta.contains_key(&par.id) {
+                child_ids.entry(par.id).or_default().push(t.id.clone());
+            }
+        }
+    }
+    for kids in child_ids.values_mut() {
+        kids.sort();
+    }
+    roots.sort();
+    Ok(roots
+        .into_iter()
+        .map(|r| to_node(&meta, &child_ids, &r))
+        .collect())
+}
+
+fn to_node(
+    meta: &HashMap<String, (String, model::TaskState)>,
+    child_ids: &HashMap<String, Vec<String>>,
+    id: &str,
+) -> TaskNode {
+    let (title, state) = meta
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| (String::new(), model::TaskState::Pending));
+    let mut kids: Vec<TaskNode> = child_ids
+        .get(id)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|cid| to_node(meta, child_ids, cid))
+        .collect();
+    kids.sort_by(|a, b| a.id.cmp(&b.id));
+    TaskNode {
+        id: id.to_owned(),
+        title,
+        state,
+        children: kids,
+    }
+}
+
+fn print_node(n: &TaskNode, depth: usize) {
+    println!("{}{} [{}] {}", "  ".repeat(depth), n.id, n.state, n.title);
+    for c in &n.children {
+        print_node(c, depth + 1);
+    }
+}
