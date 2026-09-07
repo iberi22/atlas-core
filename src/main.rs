@@ -71,7 +71,8 @@ enum Cmd {
         #[arg(long)]
         once: bool,
     },
-    /// Run the rule checks on a task (DoD + evidence, stub reviewer).
+    /// Run the rule checks on a task (DoD + evidence; external reviewer
+    /// when `ATLAS_REVIEW_CMD` is set, stub reviewer otherwise).
     Verify { id: String },
     /// Definition-of-Done checklist of a task.
     Dod {
@@ -132,7 +133,9 @@ enum Cmd {
         repo: PathBuf,
     },
     /// Print the deploy plan for a target (REQ-F-018). Main branch plus
-    /// passing fast CI for HEAD required; prints only, never executes.
+    /// passing fast CI for HEAD required; prints only, never executes,
+    /// unless `--execute` runs gates plus the real transport against the
+    /// destination configured by ATLAS_DEPLOY_DIR (no production default).
     /// Credentials are env-only at F3 and are never read here.
     Deploy {
         /// Deploy target: vps or cloudrun.
@@ -141,6 +144,13 @@ enum Cmd {
         /// Repo dir to inspect (must be a git checkout).
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// Actually execute: gates + real transport (default: print plan only).
+        #[arg(long)]
+        execute: bool,
+        /// Binary file to ship with --execute
+        /// (default: <repo>/target/release/atlas).
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
     /// Xavier memory adapter (REQ-F-019, ATLAS-09). Optional and
     /// degraded-first: every subcommand exits 0 with Xavier down.
@@ -451,7 +461,18 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Verify { id } => {
-            let report = store.verify(id).map_err(anyhow::Error::new)?;
+            let report = match atlas::verifier::CommandReviewer::from_env() {
+                Some(reviewer) => {
+                    let rep = store
+                        .verify_with(&reviewer, id)
+                        .map_err(anyhow::Error::new)?;
+                    store
+                        .evidence_add(id, &format!("review: {}", rep.reviewer))
+                        .map_err(anyhow::Error::new)?;
+                    rep
+                }
+                None => store.verify(id).map_err(anyhow::Error::new)?,
+            };
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else if report.passed {
@@ -708,11 +729,30 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Deploy { target, repo } => {
-            // Prints the plan only; never executes; reads no credentials.
-            let plan =
-                atlas::forge::deploy_gate(store, repo, target).map_err(anyhow::Error::new)?;
-            println!("{plan}");
+        Cmd::Deploy {
+            target,
+            repo,
+            execute,
+            binary,
+        } => {
+            if !execute {
+                // Prints the plan only; never executes; reads no credentials.
+                let plan =
+                    atlas::forge::deploy_gate(store, repo, target).map_err(anyhow::Error::new)?;
+                println!("{plan}");
+                return Ok(());
+            }
+            // Real path: same gates, then a real transport against the
+            // destination configured by ATLAS_DEPLOY_DIR (never a default).
+            let want: model::DeployTarget = target.parse().map_err(anyhow::Error::new)?;
+            let transport = atlas::forge::transport_from_env(want).map_err(anyhow::Error::new)?;
+            let bin = match binary {
+                Some(b) => b.clone(),
+                None => repo.join("target/release/atlas"),
+            };
+            let out = atlas::forge::deploy_execute(store, repo, target, &bin, &transport)
+                .map_err(anyhow::Error::new)?;
+            println!("{out}");
             Ok(())
         }
         Cmd::Xavier(sub) => run_xavier(sub, cli.json),

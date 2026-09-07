@@ -16,4 +16,4 @@ pub use model::{
     TaskNode, TaskState, TickSummary, VerifyReport,
 };
 pub use store::{SCHEMA_VERSION, Store};
-pub use verifier::{ReviewDecision, Reviewer, StubReviewer};
+pub use verifier::{CommandReviewer, ReviewDecision, Reviewer, StubReviewer};
