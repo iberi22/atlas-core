@@ -3,7 +3,12 @@
 mod error;
 pub mod model;
 pub mod store;
+pub mod verifier;
 
 pub use error::{AtlasError, Result};
-pub use model::{Checkpoint, Event, Session, Task, TaskNode, TaskState, TickSummary};
+pub use model::{
+    Checkpoint, DodItem, Event, EvidenceItem, Session, Task, TaskNode, TaskState, TickSummary,
+    VerifyReport,
+};
 pub use store::{SCHEMA_VERSION, Store};
+pub use verifier::{ReviewDecision, Reviewer, StubReviewer};

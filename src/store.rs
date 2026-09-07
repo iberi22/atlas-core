@@ -8,10 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::AtlasError;
 pub use crate::error::Result;
-use crate::model::{Checkpoint, Event, Session, Task, TaskState, TickSummary};
+use crate::model::{
+    Checkpoint, DodItem, Event, EvidenceItem, Session, Task, TaskState, TickSummary,
+};
 
 /// Current schema revision tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Max consecutive failures before a task escalates to FAILED (REQ-F-009).
 pub const MAX_RETRIES: i64 = 3;
@@ -62,6 +64,28 @@ CREATE TABLE IF NOT EXISTS metrics(
     completion_tokens INTEGER NOT NULL,
     outcome TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dod_items(
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    n INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    checked INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(task_id, n)
+);
+CREATE TABLE IF NOT EXISTS evidence(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence(task_id);
+CREATE TABLE IF NOT EXISTS verify_decisions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    event_id INTEGER,
+    passed INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 ";
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -110,11 +134,13 @@ impl Store {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version <= 0 {
-            // Fresh DB: full v2 schema in one batch.
+            // Fresh DB: full v3 schema in one batch.
             self.conn.execute_batch(SCHEMA_UP)?;
             self.conn
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version < SCHEMA_VERSION {
+            return Ok(());
+        }
+        if version < 2 {
             // v1 -> v2: idempotency keys + processed flags on events,
             // retry counter on tasks, durable dispatcher checkpoint.
             self.conn.execute_batch(
@@ -129,16 +155,47 @@ impl Store {
                      updated_at INTEGER NOT NULL
                  );",
             )?;
-            self.conn
-                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        if version < 3 {
+            // v2 -> v3: verifier tables (DoD checklist, evidence log,
+            // promotion decisions).
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS dod_items(
+                     task_id TEXT NOT NULL REFERENCES tasks(id),
+                     n INTEGER NOT NULL,
+                     text TEXT NOT NULL,
+                     checked INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY(task_id, n)
+                 );
+                 CREATE TABLE IF NOT EXISTS evidence(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     task_id TEXT NOT NULL REFERENCES tasks(id),
+                     text TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence(task_id);
+                 CREATE TABLE IF NOT EXISTS verify_decisions(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     task_id TEXT NOT NULL REFERENCES tasks(id),
+                     event_id INTEGER,
+                     passed INTEGER NOT NULL,
+                     reason TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );",
+            )?;
+        }
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
     /// Drop every table and reset the schema version (tests only).
     pub fn migrate_down(&self) -> Result<()> {
         self.conn.execute_batch(
-            "DROP TABLE IF EXISTS checkpoint;
+            "DROP TABLE IF EXISTS verify_decisions;
+             DROP TABLE IF EXISTS evidence;
+             DROP TABLE IF EXISTS dod_items;
+             DROP TABLE IF EXISTS checkpoint;
              DROP TABLE IF EXISTS metrics;
              DROP TABLE IF EXISTS events;
              DROP TABLE IF EXISTS edges;
@@ -484,9 +541,21 @@ impl Store {
         self.start_task(id)
     }
 
-    /// Mark COMPLETED and unlock dependents whose parents are all done.
+    /// Verifier-gated promotion to COMPLETED (REQ-F-012).
+    /// Agent self-declaration is rejected: the rule layer (DoD fully
+    /// checked + at least one evidence) must pass first. The decision
+    /// is stored on `verify_decisions`; dependents unlock as before.
     pub fn complete_task(&self, id: &str) -> Result<Task> {
         self.require_task_row(id)?;
+        let report = self.verify(id)?;
+        if !report.passed {
+            let reason = report.failures.join("; ");
+            self.record_decision(id, None, false, &reason)?;
+            return Err(AtlasError::InvalidTransition(format!(
+                "verifier rejected promotion of task {id}: {reason}"
+            )));
+        }
+        self.record_decision(id, None, true, "rules passed")?;
         self.set_state(id, TaskState::Completed)?;
         self.record_event("task_completed", &format!("{{\"id\":\"{id}\"}}"))?;
         for child in self.children_of(id)? {
@@ -507,6 +576,120 @@ impl Store {
             &format!("{{\"id\":\"{id}\",\"reason\":\"{reason}\"}}"),
         )?;
         self.get_task(id)
+    }
+
+    // -- verifier: DoD checklist + evidence (REQ-F-012/013) ------------------
+
+    /// Append a DoD checklist item; numbers run 1, 2, ... per task.
+    /// Returns the item number for `dod_check`.
+    pub fn dod_add(&self, task_id: &str, text: &str) -> Result<i64> {
+        self.require_task_row(task_id)?;
+        let next: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(n), 0) + 1 FROM dod_items WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO dod_items(task_id, n, text, checked) VALUES(?1, ?2, ?3, 0)",
+            params![task_id, next, text],
+        )?;
+        Ok(next)
+    }
+
+    /// Mark one DoD item checked (1-based per-task number).
+    pub fn dod_check(&self, task_id: &str, n: i64) -> Result<DodItem> {
+        self.require_task_row(task_id)?;
+        let updated = self.conn.execute(
+            "UPDATE dod_items SET checked = 1 WHERE task_id = ?1 AND n = ?2",
+            params![task_id, n],
+        )?;
+        if updated == 0 {
+            return Err(AtlasError::NotFound(format!(
+                "dod item {n} on task {task_id}"
+            )));
+        }
+        self.dod_get(task_id, n)
+    }
+
+    fn dod_get(&self, task_id: &str, n: i64) -> Result<DodItem> {
+        self.conn
+            .query_row(
+                "SELECT task_id, n, text, checked FROM dod_items WHERE task_id = ?1 AND n = ?2",
+                params![task_id, n],
+                dod_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| AtlasError::NotFound(format!("dod item {n} on task {task_id}")))
+    }
+
+    /// Every DoD item of a task, in number order.
+    pub fn dod_list(&self, task_id: &str) -> Result<Vec<DodItem>> {
+        self.require_task_row(task_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, n, text, checked FROM dod_items WHERE task_id = ?1 ORDER BY n",
+        )?;
+        let rows = stmt.query_map(params![task_id], dod_from_row)?;
+        rows.collect::<std::result::Result<Vec<DodItem>, _>>()
+            .map_err(AtlasError::Db)
+    }
+
+    /// Attach one evidence string to a task (REQ-F-012).
+    pub fn evidence_add(&self, task_id: &str, text: &str) -> Result<i64> {
+        self.require_task_row(task_id)?;
+        self.conn.execute(
+            "INSERT INTO evidence(task_id, text, created_at) VALUES(?1, ?2, ?3)",
+            params![task_id, text, now_secs()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every evidence string of a task, oldest first.
+    pub fn evidence_list(&self, task_id: &str) -> Result<Vec<EvidenceItem>> {
+        self.require_task_row(task_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, text, created_at FROM evidence WHERE task_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![task_id], evidence_from_row)?;
+        rows.collect::<std::result::Result<Vec<EvidenceItem>, _>>()
+            .map_err(AtlasError::Db)
+    }
+
+    /// Run the rule layer with a chosen reviewer; the decision is stored.
+    pub fn verify_with(
+        &self,
+        reviewer: &dyn crate::verifier::Reviewer,
+        task_id: &str,
+    ) -> Result<crate::model::VerifyReport> {
+        self.require_task_row(task_id)?;
+        let report = crate::verifier::verify_with(self, reviewer, task_id)?;
+        let reason = if report.passed {
+            "rules passed".to_owned()
+        } else {
+            report.failures.join("; ")
+        };
+        self.record_decision(task_id, None, report.passed, &reason)?;
+        Ok(report)
+    }
+
+    /// Run the rule layer with the bundled stub reviewer (non-blocking).
+    pub fn verify(&self, task_id: &str) -> Result<crate::model::VerifyReport> {
+        self.verify_with(&crate::verifier::StubReviewer, task_id)
+    }
+
+    /// Persist one promotion decision on the task node (REQ-F-012).
+    fn record_decision(
+        &self,
+        task_id: &str,
+        event_id: Option<i64>,
+        passed: bool,
+        reason: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO verify_decisions(task_id, event_id, passed, reason, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![task_id, event_id, i64::from(passed), reason, now_secs()],
+        )?;
+        Ok(())
     }
 
     // -- dispatcher (REQ-F-009/010/011) --------------------------------------
@@ -614,19 +797,37 @@ impl Store {
             last_event_id: self.checkpoint()?.map(|c| c.last_event_id).unwrap_or(0),
             ..Default::default()
         };
+        // Events failing the verifier gate stay queued (`processed = 0`)
+        // so a later tick can promote them; skip them in-memory to keep
+        // this pass moving over later events.
+        let mut gated: Vec<i64> = Vec::new();
         loop {
-            let next: Option<Event> = self
-                .conn
-                .query_row(
-                    "SELECT id, type, payload, idempotency_key, processed
-                     FROM events WHERE processed = 0 ORDER BY id LIMIT 1",
-                    [],
-                    event_from_row,
-                )
-                .optional()?;
+            let mut sql = String::from(
+                "SELECT id, type, payload, idempotency_key, processed
+                 FROM events WHERE processed = 0",
+            );
+            if !gated.is_empty() {
+                let ids: Vec<String> = gated.iter().map(i64::to_string).collect();
+                sql.push_str(&format!(" AND id NOT IN ({})", ids.join(",")));
+            }
+            sql.push_str(" ORDER BY id LIMIT 1");
+            let next: Option<Event> = self.conn.query_row(&sql, [], event_from_row).optional()?;
             let Some(ev) = next else { break };
             self.conn.execute("BEGIN IMMEDIATE", [])?;
             match self.apply_event(&ev) {
+                Ok(Applied::Gated(reason)) => {
+                    // Leave the event unprocessed with its reason; only the
+                    // decision row is committed.
+                    self.record_decision(
+                        &event_task_id(&ev.payload).unwrap_or_default(),
+                        Some(ev.id),
+                        false,
+                        &reason,
+                    )?;
+                    self.conn.execute("COMMIT", [])?;
+                    summary.skipped += 1;
+                    gated.push(ev.id);
+                }
                 Ok(applied) => {
                     self.conn.execute(
                         "UPDATE events SET processed = 1 WHERE id = ?1",
@@ -641,6 +842,7 @@ impl Store {
                         Applied::Retried => summary.retried += 1,
                         Applied::Escalated => summary.escalated += 1,
                         Applied::Skipped => summary.skipped += 1,
+                        Applied::Gated(_) => {}
                     }
                 }
                 Err(e) => {
@@ -671,6 +873,19 @@ impl Store {
                         Ok(Applied::Unlocked)
                     }
                     TaskState::InProgress => {
+                        // Promotion gate (REQ-F-012): no COMPLETED without
+                        // passing the rule layer. Gated events stay queued
+                        // with their reason; a later tick retries them.
+                        let report = crate::verifier::verify_with(
+                            self,
+                            &crate::verifier::StubReviewer,
+                            &id,
+                        )?;
+                        if !report.passed {
+                            let reason = report.failures.join("; ");
+                            return Ok(Applied::Gated(reason));
+                        }
+                        self.record_decision(&id, Some(ev.id), true, "rules passed")?;
                         self.set_state(&id, TaskState::Completed)?;
                         self.unlock_dependents(&id, ev.id)?;
                         Ok(Applied::Unlocked)
@@ -867,6 +1082,8 @@ enum Applied {
     Retried,
     Escalated,
     Skipped,
+    /// Verifier gate failed: event left unprocessed, carries the reason.
+    Gated(String),
 }
 
 /// Task id carried in a `task_completed` / `task_failed` payload.
@@ -883,6 +1100,25 @@ fn event_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         payload: r.get(2)?,
         idempotency_key: r.get(3)?,
         processed: processed != 0,
+    })
+}
+
+fn dod_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DodItem> {
+    let checked: i64 = r.get(3)?;
+    Ok(DodItem {
+        task_id: r.get(0)?,
+        n: r.get(1)?,
+        text: r.get(2)?,
+        checked: checked != 0,
+    })
+}
+
+fn evidence_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceItem> {
+    Ok(EvidenceItem {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        text: r.get(2)?,
+        created_at: r.get(3)?,
     })
 }
 
@@ -952,6 +1188,10 @@ mod tests {
         assert_eq!(store.get_task(&t2).expect("g").state, TaskState::Blocked);
         // Cannot start blocked work with incomplete parents.
         assert!(store.start_task(&t2).is_err());
+        // Promotion needs the verifier gate: DoD checked + evidence.
+        store.dod_add(&t1, "done").expect("dod");
+        store.dod_check(&t1, 1).expect("check");
+        store.evidence_add(&t1, "output").expect("ev");
         store.complete_task(&t1).expect("complete");
         assert_eq!(store.get_task(&t2).expect("g").state, TaskState::Ready);
         store.start_task(&t2).expect("start");
@@ -1075,6 +1315,10 @@ mod tests {
         // Only READY work may start.
         assert!(store.run_task(&l4).is_err());
         store.run_task(&l3).expect("run l3");
+        // Verifier gate must pass before the queued completion applies.
+        store.dod_add(&l3, "done").expect("dod l3");
+        store.dod_check(&l3, 1).expect("check l3");
+        store.evidence_add(&l3, "output l3").expect("ev l3");
         // `complete` queues the event; state moves only on tick.
         store.finish_task(&l3, true, "").expect("finish ok");
         assert_eq!(store.get_task(&l3).expect("g").state, TaskState::InProgress);
@@ -1086,6 +1330,9 @@ mod tests {
         // Only IN_PROGRESS tasks accept complete.
         assert!(store.finish_task(&l4, true, "").is_err());
         store.run_task(&l4).expect("run l4");
+        store.dod_add(&l4, "done").expect("dod l4");
+        store.dod_check(&l4, 1).expect("check l4");
+        store.evidence_add(&l4, "output l4").expect("ev l4");
         store.finish_task(&l4, true, "").expect("finish l4");
         store.tick_once().expect("tick2");
         assert_eq!(store.get_task(&l4).expect("g").state, TaskState::Completed);
@@ -1130,6 +1377,9 @@ mod tests {
             l3 = store.create_task(&s, "L3", None, &[]).expect("l3");
             l4 = store.create_task(&s, "L4", None, &[&l3]).expect("l4");
             store.run_task(&l3).expect("run");
+            store.dod_add(&l3, "done").expect("dod");
+            store.dod_check(&l3, 1).expect("check");
+            store.evidence_add(&l3, "output").expect("ev");
             store.finish_task(&l3, true, "").expect("finish");
             // Duplicate emission under the same idempotency key is ignored.
             let n_before: i64 = store

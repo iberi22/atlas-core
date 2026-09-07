@@ -71,6 +71,26 @@ enum Cmd {
         #[arg(long)]
         once: bool,
     },
+    /// Run the rule checks on a task (DoD + evidence, stub reviewer).
+    Verify { id: String },
+    /// Definition-of-Done checklist of a task.
+    Dod {
+        id: String,
+        #[command(subcommand)]
+        action: DodCmd,
+    },
+    /// Attach one evidence string to a task.
+    Evidence { id: String, text: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum DodCmd {
+    /// Append a checklist item (numbered per task from 1).
+    Add { text: String },
+    /// Mark item <n> checked.
+    Check { n: i64 },
+    /// List every item with its checked flag.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -296,6 +316,67 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
                     sum.skipped,
                     sum.last_event_id,
                 );
+            }
+            Ok(())
+        }
+        Cmd::Verify { id } => {
+            let report = store.verify(id).map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.passed {
+                println!(
+                    "verify {id}: PASS (dod {}/{} checked, {} evidence, {})",
+                    report.dod_checked, report.dod_total, report.evidence_count, report.reviewer,
+                );
+            } else {
+                println!("verify {id}: FAIL ({})", report.failures.join("; "));
+            }
+            Ok(())
+        }
+        Cmd::Dod { id, action } => match action {
+            DodCmd::Add { text } => {
+                let n = store.dod_add(id, text).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({"task": id, "n": n}))?
+                    );
+                } else {
+                    println!("dod {id}#{n}: {text}");
+                }
+                Ok(())
+            }
+            DodCmd::Check { n } => {
+                let item = store.dod_check(id, *n).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&item)?);
+                } else {
+                    println!("dod {id}#{n} checked: {}", item.text);
+                }
+                Ok(())
+            }
+            DodCmd::List => {
+                let items = store.dod_list(id).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&items)?);
+                } else {
+                    for it in &items {
+                        let mark = if it.checked { "x" } else { " " };
+                        println!("[{mark}] {}#{} {}", it.task_id, it.n, it.text);
+                    }
+                }
+                Ok(())
+            }
+        },
+        Cmd::Evidence { id, text } => {
+            let row = store.evidence_add(id, text).map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"task": id, "row": row}))?
+                );
+            } else {
+                println!("evidence {id}#{row}: {text}");
             }
             Ok(())
         }

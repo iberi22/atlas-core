@@ -120,3 +120,38 @@ pub struct TickSummary {
     pub skipped: usize,
     pub last_event_id: i64,
 }
+
+/// One Definition-of-Done checklist row owned by a task (REQ-F-013).
+/// Items are numbered per task starting at 1; promotion requires every
+/// item to exist-checked, i.e. no unchecked rows remain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DodItem {
+    pub task_id: String,
+    pub n: i64,
+    pub text: String,
+    pub checked: bool,
+}
+
+/// One free-form evidence string attached to a task (REQ-F-012).
+/// Promotion requires at least one row per task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceItem {
+    pub id: i64,
+    pub task_id: String,
+    pub text: String,
+    pub created_at: i64,
+}
+
+/// Rule-check outcome for one task (REQ-F-012/013).
+/// `passed` depends ONLY on the rule layer; the reviewer verdict is
+/// advisory and recorded here without blocking promotion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyReport {
+    pub task_id: String,
+    pub passed: bool,
+    pub failures: Vec<String>,
+    pub dod_total: i64,
+    pub dod_checked: i64,
+    pub evidence_count: i64,
+    pub reviewer: String,
+}
