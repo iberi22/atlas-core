@@ -142,6 +142,40 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    /// Xavier memory adapter (REQ-F-019, ATLAS-09). Optional and
+    /// degraded-first: every subcommand exits 0 with Xavier down.
+    #[command(subcommand)]
+    Xavier(XavierCmd),
+}
+
+/// Xavier subcommands: liveness, task grounding, backlog drafting.
+#[derive(Debug, Subcommand)]
+enum XavierCmd {
+    /// Detect Xavier at runtime and announce capabilities (or degraded mode).
+    Status,
+    /// Search Xavier memories for a task; prints top hits with path+score.
+    /// Unreachable Xavier prints a degraded notice with an empty result.
+    Context {
+        /// Task id being enriched (informational; not validated).
+        #[arg(long)]
+        task: String,
+        /// Query text sent to Xavier.
+        #[arg(long)]
+        query: String,
+        /// Max hits to show.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
+    /// Draft a backlog from CodeGraph/RAG hits for a goal: proposed task
+    /// titles with depends-on suggestions (`--json` is machine-readable).
+    Draft {
+        /// Goal to draft the backlog for.
+        #[arg(long)]
+        goal: String,
+        /// Max grounding hits to fetch.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -679,6 +713,113 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             let plan =
                 atlas::forge::deploy_gate(store, repo, target).map_err(anyhow::Error::new)?;
             println!("{plan}");
+            Ok(())
+        }
+        Cmd::Xavier(sub) => run_xavier(sub, cli.json),
+    }
+}
+
+/// Xavier adapter commands (REQ-F-019). Degraded-first: unreachable
+/// Xavier always yields exit 0 with an explicit degraded notice.
+fn run_xavier(sub: &XavierCmd, as_json: bool) -> Result<()> {
+    use atlas::xavier::{HttpBackend, XavierBackend, XavierConfig, draft_from_hits};
+    let backend = HttpBackend::new(XavierConfig::from_env());
+    match sub {
+        XavierCmd::Status => {
+            let status = backend.check_status();
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else if status.reachable {
+                println!("xavier: reachable at {}", status.base_url);
+                println!("capabilities: {}", status.capabilities.join(", "));
+            } else {
+                println!("xavier: degraded mode (unreachable at {})", status.base_url);
+                println!("detail: {}", status.detail);
+                println!("capabilities: none (core suite runs without xavier)");
+            }
+            Ok(())
+        }
+        XavierCmd::Context { task, query, limit } => {
+            match backend.search(query, *limit) {
+                Ok(hits) => {
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "task": task,
+                                "query": query,
+                                "degraded": false,
+                                "hits": hits,
+                            }))?
+                        );
+                    } else if hits.is_empty() {
+                        println!("context {task}: no hits for '{query}'");
+                    } else {
+                        println!("context {task}: top {} hit(s) for '{query}'", hits.len());
+                        for (i, h) in hits.iter().enumerate() {
+                            println!("  {}. [{}] {:.3} {}", i + 1, h.id, h.score, h.path);
+                            if !h.snippet.is_empty() {
+                                println!("     {}", h.snippet);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    // Degraded path: empty result, exit 0, say so loudly.
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "task": task,
+                                "query": query,
+                                "degraded": true,
+                                "hits": Vec::<serde_json::Value>::new(),
+                            }))?
+                        );
+                    } else {
+                        println!("xavier: degraded mode ({e})");
+                        println!("context {task}: empty result (no xavier, exit 0)");
+                    }
+                    Ok(())
+                }
+            }
+        }
+        XavierCmd::Draft { goal, limit } => {
+            // Grounding hits are best-effort: unreachable Xavier drafts
+            // from the goal alone (scope task only).
+            let hits = backend.search(goal, *limit).unwrap_or_default();
+            let degraded = backend.check_status().degraded && hits.is_empty();
+            let draft = draft_from_hits(goal, &hits);
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "goal": goal,
+                        "degraded": degraded,
+                        "hits": hits.len(),
+                        "draft": draft,
+                    }))?
+                );
+            } else {
+                if degraded {
+                    println!("xavier: degraded mode (drafting from goal alone)");
+                }
+                println!("draft for '{goal}': {} proposed task(s)", draft.len());
+                for (i, d) in draft.iter().enumerate() {
+                    if d.depends_on.is_empty() {
+                        println!("  {i}. {}", d.title);
+                    } else {
+                        let deps = d
+                            .depends_on
+                            .iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("  {i}. {} (depends-on: {deps})", d.title);
+                    }
+                }
+            }
             Ok(())
         }
     }

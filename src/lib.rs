@@ -8,6 +8,7 @@ pub mod model;
 pub mod serve;
 pub mod store;
 pub mod verifier;
+pub mod xavier;
 
 pub use error::{AtlasError, Result};
 pub use model::{
