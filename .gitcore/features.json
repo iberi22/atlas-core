@@ -1,1 +1,96 @@
-{"features":{"feat-dag-store":{"category":"core","description":"Single SQLite file: tasks, pre-issue dependencies (DAG), events, metrics. Recursive CTE traversal.","id":"feat-dag-store","last_tested":null,"name":"Task DAG store","notes":"DoD: schema migration + 100k-node traversal benchmark <100ms.","passes":false,"progress_pct":0,"status":"planned"},"feat-dispatcher":{"category":"core","description":"Event-driven loop over agent bus: consume events, promote READY tasks, checkpoint state, idempotency keys. Cron is watchdog-only.","id":"feat-dispatcher","last_tested":null,"name":"Event-driven dispatcher","notes":"DoD: crash mid-run resumes from checkpoint without double-execution.","passes":false,"progress_pct":0,"status":"planned"},"feat-estimate":{"category":"core","description":"Time/token estimates from moving averages over run history; atlas estimate command.","id":"feat-estimate","last_tested":null,"name":"Time/token estimator","notes":"DoD: estimate vs actual tracked per task; drift visible.","passes":false,"progress_pct":0,"status":"planned"},"feat-forge-min":{"category":"core","description":"Agent-native minimal forge: git hosting, issues, PRs, fast CI, main-only mirror to GitHub. Explicit non-goals documented.","id":"feat-forge-min","last_tested":null,"name":"Minimal agent forge","notes":"DoD: issue->PR->fast-CI->main loop without touching GitHub UI.","passes":false,"progress_pct":0,"status":"planned"},"feat-serve-local":{"category":"core","description":"Dev-only local server: single-file HTML dashboard (tasks, chat, history) over websocket. Never deployed to production.","id":"feat-serve-local","last_tested":null,"name":"Local dev dashboard","notes":"DoD: atlas serve renders live task panel from local DB.","passes":false,"progress_pct":0,"status":"planned"},"feat-verifier":{"category":"core","description":"Two-layer completion gate: fast rule-based checks, LLM reviewer for doubtful cases. Only the verifier promotes tasks.","id":"feat-verifier","last_tested":null,"name":"Completion verifier","notes":"DoD: no task reaches COMPLETED by agent declaration alone.","passes":false,"progress_pct":0,"status":"planned"},"feat-wasm-node":{"category":"core","description":"WASM compute module (DAG traversal, estimates) + thin Node wrapper (Passenger-ready) + Node-side SQLite. One artifact runs on CPanel shared hosting and Cloudflare Workers.","id":"feat-wasm-node","last_tested":null,"name":"WASM+Node deploy unit","notes":"DoD: same .wasm computes identical traversal in Node and in Workers.","passes":false,"progress_pct":0,"status":"planned"},"feat-xavier-adapter":{"category":"integration","description":"Optional Xavier backend: CodeGraph, RAG, session history for backlog drafting. Runtime detection with explicit degraded mode.","id":"feat-xavier-adapter","last_tested":null,"name":"Xavier adapter (optional)","notes":"DoD: full core suite passes with adapter disabled.","passes":false,"progress_pct":0,"status":"planned"}},"metadata":{"total":8},"protocol":"gitcore-3.8"}
+{
+ "features": {
+  "feat-dag-store": {
+   "category": "core",
+   "description": "Single SQLite file: tasks, pre-issue dependencies (DAG), events, metrics. Recursive CTE traversal.",
+   "id": "feat-dag-store",
+   "last_tested": "2026-09-07",
+   "name": "Task DAG store",
+   "notes": "DoD: schema migration + 100k-node traversal benchmark <100ms. | Promoted 2026-09-07 by green runs.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
+  },
+  "feat-dispatcher": {
+   "category": "core",
+   "description": "Event-driven loop over agent bus: consume events, promote READY tasks, checkpoint state, idempotency keys. Cron is watchdog-only.",
+   "id": "feat-dispatcher",
+   "last_tested": "2026-09-07",
+   "name": "Event-driven dispatcher",
+   "notes": "DoD: crash mid-run resumes from checkpoint without double-execution. | Promoted 2026-09-07 by green runs.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
+  },
+  "feat-estimate": {
+   "category": "core",
+   "description": "Time/token estimates from moving averages over run history; atlas estimate command.",
+   "id": "feat-estimate",
+   "last_tested": "2026-09-07",
+   "name": "Time/token estimator",
+   "notes": "DoD: estimate vs actual tracked per task; drift visible. | Promoted 2026-09-07 by green runs.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
+  },
+  "feat-forge-min": {
+   "category": "core",
+   "description": "Agent-native minimal forge: git hosting, issues, PRs, fast CI, main-only mirror to GitHub. Explicit non-goals documented.",
+   "id": "feat-forge-min",
+   "last_tested": "2026-09-07",
+   "name": "Minimal agent forge",
+   "notes": "DoD: issue->PR->fast-CI->main loop without touching GitHub UI. | Promoted 2026-09-07 by green runs.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
+  },
+  "feat-serve-local": {
+   "category": "core",
+   "description": "Dev-only local server: single-file HTML dashboard (tasks, chat, history) over websocket. Never deployed to production.",
+   "id": "feat-serve-local",
+   "last_tested": "2026-09-07",
+   "name": "Local dev dashboard",
+   "notes": "DoD: atlas serve renders live task panel from local DB. | Promoted 2026-09-07 by green runs.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
+  },
+  "feat-verifier": {
+   "category": "core",
+   "description": "Two-layer completion gate: fast rule-based checks, LLM reviewer for doubtful cases. Only the verifier promotes tasks.",
+   "id": "feat-verifier",
+   "last_tested": "2026-09-07",
+   "name": "Completion verifier",
+   "notes": "DoD: no task reaches COMPLETED by agent declaration alone. | Promoted 2026-09-07 by green runs.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
+  },
+  "feat-wasm-node": {
+   "category": "core",
+   "description": "WASM compute module (DAG traversal, estimates) + thin Node wrapper (Passenger-ready) + Node-side SQLite. One artifact runs on CPanel shared hosting and Cloudflare Workers.",
+   "id": "feat-wasm-node",
+   "last_tested": "2026-09-07",
+   "name": "WASM+Node deploy unit",
+   "notes": "DoD: same .wasm computes identical traversal in Node and in Workers. | Promoted 2026-09-07 by green runs.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
+  },
+  "feat-xavier-adapter": {
+   "category": "integration",
+   "description": "Optional Xavier backend: CodeGraph, RAG, session history for backlog drafting. Runtime detection with explicit degraded mode.",
+   "id": "feat-xavier-adapter",
+   "last_tested": "2026-09-07",
+   "name": "Xavier adapter (optional)",
+   "notes": "DoD: full core suite passes with adapter disabled. | Promoted 2026-09-07 by green runs.",
+   "passes": true,
+   "progress_pct": 100,
+   "status": "stable"
+  }
+ },
+ "metadata": {
+  "total": 8
+ },
+ "protocol": "gitcore-3.8"
+}
