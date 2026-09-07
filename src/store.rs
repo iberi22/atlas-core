@@ -9,11 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::AtlasError;
 pub use crate::error::Result;
 use crate::model::{
-    Checkpoint, DodItem, Event, EvidenceItem, Session, Task, TaskState, TickSummary,
+    Checkpoint, CiRecord, DodItem, Event, EvidenceItem, ForgeIssue, ForgePr, IssueState, PrState,
+    Session, Task, TaskState, TickSummary,
 };
 
 /// Current schema revision tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Max consecutive failures before a task escalates to FAILED (REQ-F-009).
 pub const MAX_RETRIES: i64 = 3;
@@ -86,6 +87,34 @@ CREATE TABLE IF NOT EXISTS verify_decisions(
     reason TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS forge_issues(
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'OPEN',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS forge_prs(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    base TEXT NOT NULL DEFAULT 'main',
+    branch TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'OPEN',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS forge_ci(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pr_id INTEGER NOT NULL REFERENCES forge_prs(id),
+    head_sha TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT 'fast',
+    passed INTEGER NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_forge_ci_head ON forge_ci(head_sha);
+CREATE INDEX IF NOT EXISTS idx_forge_ci_pr ON forge_ci(pr_id);
 ";
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -184,6 +213,39 @@ impl Store {
                  );",
             )?;
         }
+        if version < 4 {
+            // v3 -> v4: forge loop (issues, PRs, fast-CI evidence, REQ-F-017).
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS forge_issues(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     body TEXT NOT NULL DEFAULT '',
+                     state TEXT NOT NULL DEFAULT 'OPEN',
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS forge_prs(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     title TEXT NOT NULL,
+                     base TEXT NOT NULL DEFAULT 'main',
+                     branch TEXT NOT NULL,
+                     state TEXT NOT NULL DEFAULT 'OPEN',
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS forge_ci(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     pr_id INTEGER NOT NULL REFERENCES forge_prs(id),
+                     head_sha TEXT NOT NULL,
+                     profile TEXT NOT NULL DEFAULT 'fast',
+                     passed INTEGER NOT NULL,
+                     evidence TEXT NOT NULL DEFAULT '',
+                     created_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_forge_ci_head ON forge_ci(head_sha);
+                 CREATE INDEX IF NOT EXISTS idx_forge_ci_pr ON forge_ci(pr_id);",
+            )?;
+        }
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -192,7 +254,10 @@ impl Store {
     /// Drop every table and reset the schema version (tests only).
     pub fn migrate_down(&self) -> Result<()> {
         self.conn.execute_batch(
-            "DROP TABLE IF EXISTS verify_decisions;
+            "DROP TABLE IF EXISTS forge_ci;
+             DROP TABLE IF EXISTS forge_prs;
+             DROP TABLE IF EXISTS forge_issues;
+             DROP TABLE IF EXISTS verify_decisions;
              DROP TABLE IF EXISTS evidence;
              DROP TABLE IF EXISTS dod_items;
              DROP TABLE IF EXISTS checkpoint;
@@ -685,6 +750,181 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![task_id], evidence_from_row)?;
         rows.collect::<std::result::Result<Vec<EvidenceItem>, _>>()
+            .map_err(AtlasError::Db)
+    }
+
+    // -- forge loop (REQ-F-017/018) ------------------------------------------
+    // Issues, PRs, and fast-CI evidence live in the SAME SQLite file.
+    // Branch existence is validated by the caller (`forge::branch_exists`)
+    // before `pr_create`; the store only records the validated name.
+
+    /// Create a forge issue in state OPEN and return its id.
+    pub fn issue_create(&self, title: &str, body: &str) -> Result<String> {
+        if title.trim().is_empty() {
+            return Err(AtlasError::Forge(
+                "issue title must not be empty".to_owned(),
+            ));
+        }
+        let id = new_id("iss_");
+        let now = now_secs();
+        self.conn.execute(
+            "INSERT INTO forge_issues(id, title, body, state, created_at, updated_at)
+             VALUES(?1, ?2, ?3, 'OPEN', ?4, ?4)",
+            params![id, title, body, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Fetch one forge issue by id.
+    pub fn issue_get(&self, id: &str) -> Result<ForgeIssue> {
+        self.conn
+            .query_row(
+                "SELECT id, title, body, state, created_at, updated_at
+                 FROM forge_issues WHERE id = ?1",
+                params![id],
+                forge_issue_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| AtlasError::NotFound(format!("issue {id}")))
+    }
+
+    /// Every forge issue, oldest first.
+    pub fn issue_list(&self) -> Result<Vec<ForgeIssue>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, body, state, created_at, updated_at
+             FROM forge_issues ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], forge_issue_from_row)?;
+        rows.collect::<std::result::Result<Vec<ForgeIssue>, _>>()
+            .map_err(AtlasError::Db)
+    }
+
+    /// Move an OPEN issue to CLOSED.
+    pub fn issue_close(&self, id: &str) -> Result<ForgeIssue> {
+        let issue = self.issue_get(id)?;
+        if issue.state != IssueState::Open {
+            return Err(AtlasError::InvalidTransition(format!(
+                "issue {id} is already {}",
+                issue.state
+            )));
+        }
+        self.conn.execute(
+            "UPDATE forge_issues SET state = 'CLOSED', updated_at = ?1 WHERE id = ?2",
+            params![now_secs(), id],
+        )?;
+        self.issue_get(id)
+    }
+
+    /// Record a PR row in state OPEN. The caller must have validated
+    /// `branch` with `git rev-parse --verify` (see `forge::branch_exists`).
+    pub fn pr_create(&self, title: &str, base: &str, branch: &str) -> Result<i64> {
+        if title.trim().is_empty() {
+            return Err(AtlasError::Forge("pr title must not be empty".to_owned()));
+        }
+        if branch.trim().is_empty() {
+            return Err(AtlasError::Forge("pr branch must not be empty".to_owned()));
+        }
+        let now = now_secs();
+        self.conn.execute(
+            "INSERT INTO forge_prs(title, base, branch, state, created_at, updated_at)
+             VALUES(?1, ?2, ?3, 'OPEN', ?4, ?4)",
+            params![title, base, branch, now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Fetch one PR by id.
+    pub fn pr_get(&self, id: i64) -> Result<ForgePr> {
+        self.conn
+            .query_row(
+                "SELECT id, title, base, branch, state, created_at, updated_at
+                 FROM forge_prs WHERE id = ?1",
+                params![id],
+                forge_pr_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| AtlasError::NotFound(format!("pr {id}")))
+    }
+
+    /// Every PR, oldest first.
+    pub fn pr_list(&self) -> Result<Vec<ForgePr>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, base, branch, state, created_at, updated_at
+             FROM forge_prs ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], forge_pr_from_row)?;
+        rows.collect::<std::result::Result<Vec<ForgePr>, _>>()
+            .map_err(AtlasError::Db)
+    }
+
+    /// Move a PR to MERGED or CLOSED (OPEN only; no reopen).
+    pub fn pr_set_state(&self, id: i64, state: PrState) -> Result<ForgePr> {
+        let pr = self.pr_get(id)?;
+        if pr.state != PrState::Open {
+            return Err(AtlasError::InvalidTransition(format!(
+                "pr {id} is already {}",
+                pr.state
+            )));
+        }
+        if state == PrState::Open {
+            return Err(AtlasError::InvalidTransition(
+                "pr target state must be MERGED or CLOSED".to_owned(),
+            ));
+        }
+        self.conn.execute(
+            "UPDATE forge_prs SET state = ?1, updated_at = ?2 WHERE id = ?3",
+            params![state.as_str(), now_secs(), id],
+        )?;
+        self.pr_get(id)
+    }
+
+    /// Record one fast-CI run (PASS/FAIL + evidence) on a PR.
+    pub fn ci_record(
+        &self,
+        pr_id: i64,
+        head_sha: &str,
+        profile: &str,
+        passed: bool,
+        evidence: &str,
+    ) -> Result<i64> {
+        self.pr_get(pr_id)?; // 404 on unknown PRs.
+        self.conn.execute(
+            "INSERT INTO forge_ci(pr_id, head_sha, profile, passed, evidence, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                pr_id,
+                head_sha,
+                profile,
+                i64::from(passed),
+                evidence,
+                now_secs()
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Latest CI record for an exact HEAD sha (any PR); the deploy gate
+    /// (REQ-F-018) requires this to exist with `passed = true`.
+    pub fn ci_latest_for_head(&self, head_sha: &str) -> Result<Option<CiRecord>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, pr_id, head_sha, profile, passed, evidence, created_at
+                 FROM forge_ci WHERE head_sha = ?1 ORDER BY id DESC LIMIT 1",
+                params![head_sha],
+                ci_record_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Every CI record of a PR, oldest first.
+    pub fn ci_list_for_pr(&self, pr_id: i64) -> Result<Vec<CiRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pr_id, head_sha, profile, passed, evidence, created_at
+             FROM forge_ci WHERE pr_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![pr_id], ci_record_from_row)?;
+        rows.collect::<std::result::Result<Vec<CiRecord>, _>>()
             .map_err(AtlasError::Db)
     }
 
@@ -1235,6 +1475,49 @@ fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         attempts: r.get(5)?,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+    })
+}
+
+/// Map a `forge_issues` row; unknown states fall back to OPEN.
+fn forge_issue_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ForgeIssue> {
+    use std::str::FromStr as _;
+    let state: String = r.get(3)?;
+    Ok(ForgeIssue {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        body: r.get(2)?,
+        state: IssueState::from_str(&state).unwrap_or(IssueState::Open),
+        created_at: r.get(4)?,
+        updated_at: r.get(5)?,
+    })
+}
+
+/// Map a `forge_prs` row; unknown states fall back to OPEN.
+fn forge_pr_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ForgePr> {
+    use std::str::FromStr as _;
+    let state: String = r.get(4)?;
+    Ok(ForgePr {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        base: r.get(2)?,
+        branch: r.get(3)?,
+        state: PrState::from_str(&state).unwrap_or(PrState::Open),
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+    })
+}
+
+/// Map a `forge_ci` row.
+fn ci_record_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CiRecord> {
+    let passed: i64 = r.get(4)?;
+    Ok(CiRecord {
+        id: r.get(0)?,
+        pr_id: r.get(1)?,
+        head_sha: r.get(2)?,
+        profile: r.get(3)?,
+        passed: passed != 0,
+        evidence: r.get(5)?,
+        created_at: r.get(6)?,
     })
 }
 

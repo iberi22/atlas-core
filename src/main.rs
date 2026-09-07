@@ -113,6 +113,35 @@ enum Cmd {
         #[arg(long)]
         public: bool,
     },
+    /// Forge issue operations (REQ-F-017, same SQLite DB).
+    #[command(subcommand)]
+    Issue(IssueCmd),
+    /// Forge pull-request operations (REQ-F-017, same SQLite DB).
+    #[command(subcommand)]
+    Pr(PrCmd),
+    /// Run the fast CI profile for a PR and record PASS/FAIL (REQ-F-017).
+    Ci {
+        /// PR id the run belongs to.
+        #[arg(long)]
+        pr: i64,
+        /// Fast profile: `cargo test --offline` + `cargo fmt --check`.
+        #[arg(long)]
+        fast: bool,
+        /// Repo dir to test (must be a git checkout).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Print the deploy plan for a target (REQ-F-018). Main branch plus
+    /// passing fast CI for HEAD required; prints only, never executes.
+    /// Credentials are env-only at F3 and are never read here.
+    Deploy {
+        /// Deploy target: vps or cloudrun.
+        #[arg(long)]
+        target: String,
+        /// Repo dir to inspect (must be a git checkout).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -154,6 +183,42 @@ enum TaskCmd {
     },
     /// Move a READY task to IN_PROGRESS.
     Start { id: String },
+}
+
+/// Forge issue subcommands (REQ-F-017).
+#[derive(Debug, Subcommand)]
+enum IssueCmd {
+    /// Create an issue in state OPEN.
+    Create {
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+    },
+    /// List every issue, oldest first.
+    List,
+    /// Move an OPEN issue to CLOSED.
+    Close { id: String },
+}
+
+/// Forge pull-request subcommands (REQ-F-017).
+#[derive(Debug, Subcommand)]
+enum PrCmd {
+    /// Record a PR in state OPEN; `branch` must exist locally
+    /// (checked with `git rev-parse --verify`).
+    Create {
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "main")]
+        base: String,
+        #[arg(long)]
+        branch: String,
+        /// Repo dir holding the branch (default: current dir).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// List every PR, oldest first.
+    List,
 }
 
 fn main() -> Result<()> {
@@ -497,6 +562,123 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
                 .map_err(anyhow::Error::new)?;
             println!("serving dashboard on {}:{}", cfg.host, cfg.port);
             atlas::serve::run_server(&cfg).map_err(anyhow::Error::new)?;
+            Ok(())
+        }
+        Cmd::Issue(sub) => match sub {
+            IssueCmd::Create { title, body } => {
+                let id = store
+                    .issue_create(title, body)
+                    .map_err(anyhow::Error::new)?;
+                let issue = store.issue_get(&id).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&issue)?);
+                } else {
+                    println!(
+                        "created issue {} [{}] {}",
+                        issue.id, issue.state, issue.title
+                    );
+                }
+                Ok(())
+            }
+            IssueCmd::List => {
+                let issues = store.issue_list().map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&issues)?);
+                } else {
+                    for i in &issues {
+                        println!("{} [{}] {}", i.id, i.state, i.title);
+                    }
+                }
+                Ok(())
+            }
+            IssueCmd::Close { id } => {
+                let issue = store.issue_close(id).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&issue)?);
+                } else {
+                    println!("closed issue {}", issue.id);
+                }
+                Ok(())
+            }
+        },
+        Cmd::Pr(sub) => match sub {
+            PrCmd::Create {
+                title,
+                base,
+                branch,
+                repo,
+            } => {
+                let id = atlas::forge::pr_create_validated(store, repo, title, base, branch)
+                    .map_err(anyhow::Error::new)?;
+                let pr = store.pr_get(id).map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&pr)?);
+                } else {
+                    println!(
+                        "created pr {} [{}] {} ({} -> {})",
+                        pr.id, pr.state, pr.title, pr.branch, pr.base
+                    );
+                }
+                Ok(())
+            }
+            PrCmd::List => {
+                let prs = store.pr_list().map_err(anyhow::Error::new)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&prs)?);
+                } else {
+                    for p in &prs {
+                        println!(
+                            "#{} [{}] {} ({} -> {})",
+                            p.id, p.state, p.title, p.branch, p.base
+                        );
+                    }
+                }
+                Ok(())
+            }
+        },
+        Cmd::Ci { pr, fast, repo } => {
+            if !fast {
+                return Err(anyhow!("only the fast profile is supported; pass --fast"));
+            }
+            // 404 early on unknown PRs before spending time on cargo.
+            store.pr_get(*pr).map_err(anyhow::Error::new)?;
+            let head = atlas::forge::head_sha(repo).map_err(anyhow::Error::new)?;
+            let outcome = atlas::forge::run_fast_ci(repo);
+            let row = store
+                .ci_record(
+                    *pr,
+                    &head,
+                    atlas::forge::FAST_PROFILE,
+                    outcome.passed,
+                    &outcome.evidence,
+                )
+                .map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "pr": pr,
+                        "row": row,
+                        "head": head,
+                        "passed": outcome.passed,
+                        "evidence": outcome.evidence,
+                    }))?
+                );
+            } else if outcome.passed {
+                println!("ci pr {pr} HEAD {head}: PASS (row {row})");
+            } else {
+                println!(
+                    "ci pr {pr} HEAD {head}: FAIL (row {row})\n{}",
+                    outcome.evidence
+                );
+            }
+            Ok(())
+        }
+        Cmd::Deploy { target, repo } => {
+            // Prints the plan only; never executes; reads no credentials.
+            let plan =
+                atlas::forge::deploy_gate(store, repo, target).map_err(anyhow::Error::new)?;
+            println!("{plan}");
             Ok(())
         }
     }

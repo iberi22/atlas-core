@@ -155,3 +155,145 @@ pub struct VerifyReport {
     pub evidence_count: i64,
     pub reviewer: String,
 }
+
+/// Lifecycle of a forge issue (REQ-F-017): OPEN until closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IssueState {
+    Open,
+    Closed,
+}
+
+impl IssueState {
+    /// Canonical uppercase name stored in SQLite.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "OPEN",
+            Self::Closed => "CLOSED",
+        }
+    }
+}
+
+impl fmt::Display for IssueState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IssueState {
+    type Err = AtlasError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "OPEN" => Ok(Self::Open),
+            "CLOSED" => Ok(Self::Closed),
+            other => Err(AtlasError::InvalidState(other.to_owned())),
+        }
+    }
+}
+
+/// Lifecycle of a forge pull request (REQ-F-017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+}
+
+impl PrState {
+    /// Canonical uppercase name stored in SQLite.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "OPEN",
+            Self::Merged => "MERGED",
+            Self::Closed => "CLOSED",
+        }
+    }
+}
+
+impl fmt::Display for PrState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PrState {
+    type Err = AtlasError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "OPEN" => Ok(Self::Open),
+            "MERGED" => Ok(Self::Merged),
+            "CLOSED" => Ok(Self::Closed),
+            other => Err(AtlasError::InvalidState(other.to_owned())),
+        }
+    }
+}
+
+/// One forge issue row (REQ-F-017), stored in the same SQLite DB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeIssue {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub state: IssueState,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One forge pull request row (REQ-F-017): `branch` must name a real
+/// local git branch (validated with `git rev-parse --verify` at create).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgePr {
+    pub id: i64,
+    pub title: String,
+    pub base: String,
+    pub branch: String,
+    pub state: PrState,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Fast-CI evidence attached to a PR (REQ-F-017): profile is `fast`
+/// (`cargo test --offline` + `cargo fmt --check`); `passed` gates deploy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CiRecord {
+    pub id: i64,
+    pub pr_id: i64,
+    pub head_sha: String,
+    pub profile: String,
+    pub passed: bool,
+    pub evidence: String,
+    pub created_at: i64,
+}
+
+/// Deploy target for `atlas deploy` (REQ-F-018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeployTarget {
+    Vps,
+    Cloudrun,
+}
+
+impl fmt::Display for DeployTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vps => f.write_str("vps"),
+            Self::Cloudrun => f.write_str("cloudrun"),
+        }
+    }
+}
+
+impl FromStr for DeployTarget {
+    type Err = AtlasError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "vps" => Ok(Self::Vps),
+            "cloudrun" => Ok(Self::Cloudrun),
+            other => Err(AtlasError::Forge(format!(
+                "unknown deploy target '{other}' (want vps|cloudrun)"
+            ))),
+        }
+    }
+}

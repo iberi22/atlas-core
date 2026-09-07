@@ -22,6 +22,9 @@ pub enum AtlasError {
     /// Local dashboard socket failure.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Forge loop failure (bad branch, CI gate, deploy gate).
+    #[error("forge error: {0}")]
+    Forge(String),
 }
 
 /// Store-level result alias.
