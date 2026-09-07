@@ -2,6 +2,7 @@
 // The `atlas` binary (src/main.rs) is a thin CLI over this API (REQ-F-007).
 pub mod dag;
 mod error;
+pub mod estimator;
 pub mod model;
 pub mod store;
 pub mod verifier;

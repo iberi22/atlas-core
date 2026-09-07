@@ -81,6 +81,25 @@ enum Cmd {
     },
     /// Attach one evidence string to a task.
     Evidence { id: String, text: String },
+    /// Record per-task actuals: wall time plus token usage (REQ-F-014).
+    Record {
+        id: String,
+        #[arg(long)]
+        duration_ms: i64,
+        #[arg(long)]
+        prompt_toks: i64,
+        #[arg(long)]
+        completion_toks: i64,
+        #[arg(long)]
+        outcome: String,
+    },
+    /// Estimate one task or roll up the whole tree with critical path
+    /// and estimate-vs-actual drift (REQ-F-015).
+    Estimate {
+        id: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -380,6 +399,79 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Record {
+            id,
+            duration_ms,
+            prompt_toks,
+            completion_toks,
+            outcome,
+        } => {
+            if outcome != "ok" && outcome != "fail" {
+                return Err(anyhow!("outcome must be ok or fail, got '{outcome}'"));
+            }
+            store
+                .record_metric(id, *duration_ms, *prompt_toks, *completion_toks, outcome)
+                .map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "task": id,
+                        "duration_ms": duration_ms,
+                        "prompt_toks": prompt_toks,
+                        "completion_toks": completion_toks,
+                        "outcome": outcome,
+                    }))?
+                );
+            } else {
+                println!(
+                    "recorded {id}: {duration_ms}ms {prompt_toks}+{completion_toks} toks ({outcome})"
+                );
+            }
+            Ok(())
+        }
+        Cmd::Estimate { id, session } => {
+            if cli.json {
+                if let Some(task_id) = id {
+                    let est = atlas::estimator::estimate_task(store, task_id)
+                        .map_err(anyhow::Error::new)?;
+                    println!("{}", serde_json::to_string_pretty(&est)?);
+                } else {
+                    let sess = match session {
+                        Some(s) => Some(s.clone()),
+                        None => resolve_session(store, &None).ok(),
+                    };
+                    let roll = atlas::estimator::estimate_session(store, sess.as_deref())
+                        .map_err(anyhow::Error::new)?;
+                    println!("{}", serde_json::to_string_pretty(&roll)?);
+                }
+                return Ok(());
+            }
+            if let Some(task_id) = id {
+                let est =
+                    atlas::estimator::estimate_task(store, task_id).map_err(anyhow::Error::new)?;
+                print_estimate(&est);
+            }
+            let sess = match session {
+                Some(s) => Some(s.clone()),
+                None => resolve_session(store, &None).ok(),
+            };
+            match sess {
+                Some(s) => {
+                    let roll = atlas::estimator::estimate_session(store, Some(&s))
+                        .map_err(anyhow::Error::new)?;
+                    print_rollup(&roll);
+                }
+                None => {
+                    if id.is_none() {
+                        return Err(anyhow!(
+                            "no session yet; run `atlas start --goal \"...\"` first"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -454,5 +546,48 @@ fn print_node(n: &TaskNode, depth: usize) {
     println!("{}{} [{}] {}", "  ".repeat(depth), n.id, n.state, n.title);
     for c in &n.children {
         print_node(c, depth + 1);
+    }
+}
+
+/// One-line per-task estimate with its history source and actual, if any.
+fn print_estimate(e: &atlas::estimator::TaskEstimate) {
+    let src = if e.from_history {
+        format!("avg({} samples)", e.samples)
+    } else {
+        "default".to_owned()
+    };
+    println!(
+        "estimate {} '{}': {}ms {}+{} toks [{src}]",
+        e.task_id, e.title, e.duration_ms, e.prompt_tokens, e.completion_tokens
+    );
+    if let Some(a) = &e.actual {
+        let drift = a.duration_ms - e.duration_ms;
+        let sign = if drift >= 0 { "+" } else { "" };
+        println!(
+            "  actual: {}ms {}+{} toks ({}) drift {sign}{drift}ms",
+            a.duration_ms, a.prompt_tokens, a.completion_tokens, a.outcome
+        );
+    }
+}
+
+/// Whole-tree rollup: per-task rows, critical path, totals, drift.
+fn print_rollup(r: &atlas::estimator::Rollup) {
+    for e in &r.per_task {
+        print_estimate(e);
+    }
+    println!(
+        "total: {}ms sum / {}ms critical path [{}]",
+        r.total_sum_ms,
+        r.critical_path_ms,
+        r.critical_path.join(" -> ")
+    );
+    if r.actuals_count > 0 {
+        let sign = if r.drift_ms >= 0 { "+" } else { "" };
+        println!(
+            "drift: {sign}{}ms over {} actual(s)",
+            r.drift_ms, r.actuals_count
+        );
+    } else {
+        println!("drift: no actuals recorded yet");
     }
 }

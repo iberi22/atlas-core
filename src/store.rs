@@ -1048,6 +1048,11 @@ impl Store {
         completion_tokens: i64,
         outcome: &str,
     ) -> Result<()> {
+        if duration_ms < 0 || prompt_tokens < 0 || completion_tokens < 0 {
+            return Err(AtlasError::InvalidState(
+                "metric values must be >= 0".to_owned(),
+            ));
+        }
         self.require_task_row(task_id)?;
         self.conn.execute(
             "INSERT OR REPLACE INTO metrics(task_id, duration_ms, prompt_tokens, completion_tokens, outcome)
@@ -1055,6 +1060,57 @@ impl Store {
             params![task_id, duration_ms, prompt_tokens, completion_tokens, outcome],
         )?;
         Ok(())
+    }
+
+    /// Latest actual for one task, if any (REQ-F-014).
+    pub fn get_metric(&self, task_id: &str) -> Result<Option<crate::estimator::MetricActual>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT task_id, duration_ms, prompt_tokens, completion_tokens, outcome
+                 FROM metrics WHERE task_id = ?1",
+                params![task_id],
+                |r| {
+                    Ok(crate::estimator::MetricActual {
+                        task_id: r.get(0)?,
+                        duration_ms: r.get(1)?,
+                        prompt_tokens: r.get(2)?,
+                        completion_tokens: r.get(3)?,
+                        outcome: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Actuals of tasks whose title shares `prefix` (first token,
+    /// lowercased), optionally excluding one task so its own row never
+    /// feeds its estimate. Empty prefix matches nothing.
+    pub fn metrics_for_prefix(
+        &self,
+        prefix: &str,
+        exclude: Option<&str>,
+    ) -> Result<Vec<crate::estimator::MetricActual>> {
+        if prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT m.task_id, m.duration_ms, m.prompt_tokens, m.completion_tokens, m.outcome
+             FROM metrics m JOIN tasks t ON t.id = m.task_id
+             WHERE lower(substr(t.title, 1, instr(t.title || ' ', ' ') - 1)) = ?1
+               AND (?2 IS NULL OR m.task_id != ?2)",
+        )?;
+        let rows = stmt.query_map(params![prefix, exclude], |r| {
+            Ok(crate::estimator::MetricActual {
+                task_id: r.get(0)?,
+                duration_ms: r.get(1)?,
+                prompt_tokens: r.get(2)?,
+                completion_tokens: r.get(3)?,
+                outcome: r.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(AtlasError::Db)
     }
 
     // -- traversal ---------------------------------------------------------
