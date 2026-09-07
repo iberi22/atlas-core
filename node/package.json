@@ -1,0 +1,17 @@
+{
+  "name": "atlas-node",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Thin Passenger-ready Node wrapper over atlas-wasm (ADR-004). Pure-JS traversal mirror; swaps in atlas_wasm.wasm when the artifact exists.",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "smoke": "node -e \"try{require('better-sqlite3');console.log('smoke ok: better-sqlite3 present')}catch(e){console.error('SMOKE FAIL: better-sqlite3 no instalado. Es dependencia declarada pero NO instalada en este repo (red medida: sin npm install). Instala en el servidor/oficina con: npm install --omit=dev');process.exit(1)}\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
