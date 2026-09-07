@@ -4,7 +4,7 @@ use atlas::{Store, model, store};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use atlas::model::TaskNode;
@@ -861,9 +861,10 @@ fn build_tree(store: &Store, session: &str) -> store::Result<Vec<TaskNode>> {
         kids.sort();
     }
     roots.sort();
+    let mut visited: HashSet<String> = HashSet::with_capacity(tasks.len());
     Ok(roots
         .into_iter()
-        .map(|r| to_node(&meta, &child_ids, &r))
+        .filter_map(|r| to_node(&meta, &child_ids, &r, &mut visited))
         .collect())
 }
 
@@ -871,7 +872,11 @@ fn to_node(
     meta: &HashMap<String, (String, model::TaskState)>,
     child_ids: &HashMap<String, Vec<String>>,
     id: &str,
-) -> TaskNode {
+    visited: &mut HashSet<String>,
+) -> Option<TaskNode> {
+    if !visited.insert(id.to_owned()) {
+        return None;
+    }
     let (title, state) = meta
         .get(id)
         .cloned()
@@ -881,15 +886,15 @@ fn to_node(
         .cloned()
         .unwrap_or_default()
         .iter()
-        .map(|cid| to_node(meta, child_ids, cid))
+        .filter_map(|cid| to_node(meta, child_ids, cid, visited))
         .collect();
     kids.sort_by(|a, b| a.id.cmp(&b.id));
-    TaskNode {
+    Some(TaskNode {
         id: id.to_owned(),
         title,
         state,
         children: kids,
-    }
+    })
 }
 
 fn print_node(n: &TaskNode, depth: usize) {
@@ -939,5 +944,46 @@ fn print_rollup(r: &atlas::estimator::Rollup) {
         );
     } else {
         println!("drift: no actuals recorded yet");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn count_occurrences(nodes: &[TaskNode], id: &str) -> usize {
+        nodes
+            .iter()
+            .map(|n| usize::from(n.id == id) + count_occurrences(&n.children, id))
+            .sum()
+    }
+
+    /// Diamante A -> {B, C} -> D: D tiene dos padres y debe aparecer una sola vez.
+    /// Sin el set de visitados, D se expande bajo B y bajo C (2 ocurrencias).
+    #[test]
+    fn tree_renders_multi_parent_node_once() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let session = store.create_session("diamante").expect("session");
+        let a = store.create_task(&session, "A", None, &[]).expect("task A");
+        let b = store
+            .create_task(&session, "B", None, &[&a])
+            .expect("task B");
+        let c = store
+            .create_task(&session, "C", None, &[&a])
+            .expect("task C");
+        let d = store
+            .create_task(&session, "D", None, &[&b])
+            .expect("task D");
+        store.add_dependency(&d, &c).expect("D depende de C");
+
+        let roots = build_tree(&store, &session).expect("tree");
+        assert_eq!(
+            count_occurrences(&roots, &d),
+            1,
+            "D con 2 padres sale 1 vez"
+        );
+        assert_eq!(count_occurrences(&roots, &a), 1);
+        assert_eq!(count_occurrences(&roots, &b), 1);
+        assert_eq!(count_occurrences(&roots, &c), 1);
     }
 }
