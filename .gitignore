@@ -1,0 +1,16 @@
+# Rust
+/target/
+Cargo.lock
+*.db
+*.sqlite*
+*.wasm
+# Node (wasm wrapper)
+/node_modules/
+/dist/
+# Env and secrets
+.env
+.env.*
+!.env.example
+# Runtime
+*.log
+.DS_Store
