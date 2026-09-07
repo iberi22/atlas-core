@@ -5,5 +5,5 @@ pub mod model;
 pub mod store;
 
 pub use error::{AtlasError, Result};
-pub use model::{Session, Task, TaskNode, TaskState};
+pub use model::{Checkpoint, Event, Session, Task, TaskNode, TaskState, TickSummary};
 pub use store::{SCHEMA_VERSION, Store};

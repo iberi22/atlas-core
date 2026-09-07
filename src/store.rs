@@ -8,10 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::AtlasError;
 pub use crate::error::Result;
-use crate::model::{Session, Task, TaskState};
+use crate::model::{Checkpoint, Event, Session, Task, TaskState, TickSummary};
 
 /// Current schema revision tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
+
+/// Max consecutive failures before a task escalates to FAILED (REQ-F-009).
+pub const MAX_RETRIES: i64 = 3;
 
 const SCHEMA_UP: &str = "
 CREATE TABLE IF NOT EXISTS sessions(
@@ -26,6 +29,7 @@ CREATE TABLE IF NOT EXISTS tasks(
     title TEXT NOT NULL,
     state TEXT NOT NULL,
     agent TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -40,7 +44,16 @@ CREATE TABLE IF NOT EXISTS events(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT NOT NULL,
     payload TEXT NOT NULL,
+    idempotency_key TEXT,
+    processed INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem ON events(idempotency_key);
+CREATE TABLE IF NOT EXISTS checkpoint(
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    last_event_id INTEGER NOT NULL,
+    snapshot TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS metrics(
     task_id TEXT PRIMARY KEY REFERENCES tasks(id),
@@ -96,8 +109,26 @@ impl Store {
         let version: i32 = self
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < SCHEMA_VERSION {
+        if version <= 0 {
+            // Fresh DB: full v2 schema in one batch.
             self.conn.execute_batch(SCHEMA_UP)?;
+            self.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if version < SCHEMA_VERSION {
+            // v1 -> v2: idempotency keys + processed flags on events,
+            // retry counter on tasks, durable dispatcher checkpoint.
+            self.conn.execute_batch(
+                "ALTER TABLE events ADD COLUMN idempotency_key TEXT;
+                 ALTER TABLE events ADD COLUMN processed INTEGER NOT NULL DEFAULT 0;
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem ON events(idempotency_key);
+                 ALTER TABLE tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+                 CREATE TABLE IF NOT EXISTS checkpoint(
+                     id INTEGER PRIMARY KEY CHECK(id = 1),
+                     last_event_id INTEGER NOT NULL,
+                     snapshot TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );",
+            )?;
             self.conn
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -107,7 +138,8 @@ impl Store {
     /// Drop every table and reset the schema version (tests only).
     pub fn migrate_down(&self) -> Result<()> {
         self.conn.execute_batch(
-            "DROP TABLE IF EXISTS metrics;
+            "DROP TABLE IF EXISTS checkpoint;
+             DROP TABLE IF EXISTS metrics;
              DROP TABLE IF EXISTS events;
              DROP TABLE IF EXISTS edges;
              DROP TABLE IF EXISTS tasks;
@@ -212,7 +244,7 @@ impl Store {
     fn require_task_row(&self, id: &str) -> Result<Task> {
         self.conn
             .query_row(
-                "SELECT id, session_id, title, state, agent, created_at, updated_at
+                "SELECT id, session_id, title, state, agent, attempts, created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
                 |r| {
@@ -229,8 +261,9 @@ impl Store {
                             )
                         })?,
                         agent: r.get(4)?,
-                        created_at: r.get(5)?,
-                        updated_at: r.get(6)?,
+                        attempts: r.get(5)?,
+                        created_at: r.get(6)?,
+                        updated_at: r.get(7)?,
                     })
                 },
             )
@@ -350,7 +383,7 @@ impl Store {
     }
 
     pub fn list_tasks(&self, session: Option<&str>) -> Result<Vec<Task>> {
-        let sql = "SELECT id, session_id, title, state, agent, created_at, updated_at
+        let sql = "SELECT id, session_id, title, state, agent, attempts, created_at, updated_at
                  FROM tasks";
         let mut out = Vec::new();
         if let Some(s) = session {
@@ -375,7 +408,7 @@ impl Store {
 
     pub fn parents_of(&self, child: &str) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.session_id, t.title, t.state, t.agent, t.created_at, t.updated_at
+            "SELECT t.id, t.session_id, t.title, t.state, t.agent, t.attempts, t.created_at, t.updated_at
              FROM tasks t JOIN edges e ON e.parent_id = t.id WHERE e.child_id = ?1",
         )?;
         let rows = stmt.query_map(params![child], task_from_row)?;
@@ -385,7 +418,7 @@ impl Store {
 
     pub fn children_of(&self, parent: &str) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.session_id, t.title, t.state, t.agent, t.created_at, t.updated_at
+            "SELECT t.id, t.session_id, t.title, t.state, t.agent, t.attempts, t.created_at, t.updated_at
              FROM tasks t JOIN edges e ON e.child_id = t.id WHERE e.parent_id = ?1",
         )?;
         let rows = stmt.query_map(params![parent], task_from_row)?;
@@ -430,14 +463,12 @@ impl Store {
         self.get_task(id)
     }
 
-    /// Move READY (or BLOCKED with complete parents) to IN_PROGRESS.
+    /// Move a READY task to IN_PROGRESS (REQ-F-009 gate: only READY
+    /// work may reach the agent backend). Anything else is rejected.
     pub fn start_task(&self, id: &str) -> Result<Task> {
         let task = self.require_task_row(id)?;
         match task.state {
-            TaskState::Ready | TaskState::Pending => self.set_state(id, TaskState::InProgress)?,
-            TaskState::Blocked if self.incomplete_parents(id)? == 0 => {
-                self.set_state(id, TaskState::InProgress)?;
-            }
+            TaskState::Ready => self.set_state(id, TaskState::InProgress)?,
             other => {
                 return Err(AtlasError::InvalidTransition(format!(
                     "task {id} is {other}, only READY work can start"
@@ -446,6 +477,11 @@ impl Store {
         }
         self.record_event("task_started", &format!("{{\"id\":\"{id}\"}}"))?;
         self.get_task(id)
+    }
+
+    /// Strict entry point for `atlas run <id>`: READY -> IN_PROGRESS.
+    pub fn run_task(&self, id: &str) -> Result<Task> {
+        self.start_task(id)
     }
 
     /// Mark COMPLETED and unlock dependents whose parents are all done.
@@ -471,6 +507,278 @@ impl Store {
             &format!("{{\"id\":\"{id}\",\"reason\":\"{reason}\"}}"),
         )?;
         self.get_task(id)
+    }
+
+    // -- dispatcher (REQ-F-009/010/011) --------------------------------------
+
+    /// Insert an event; with a key the insert is idempotent (`INSERT OR
+    /// IGNORE`) and the row id for that key is returned (REQ-F-010).
+    pub fn emit_event(&self, kind: &str, payload: &str, key: Option<&str>) -> Result<i64> {
+        if let Some(k) = key {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO events(type, payload, idempotency_key, processed, created_at)
+                 VALUES(?1, ?2, ?3, 0, ?4)",
+                params![kind, payload, k, now_secs()],
+            )?;
+            Ok(self.conn.query_row(
+                "SELECT id FROM events WHERE idempotency_key = ?1",
+                params![k],
+                |r| r.get(0),
+            )?)
+        } else {
+            self.conn.execute(
+                "INSERT INTO events(type, payload, processed, created_at) VALUES(?1, ?2, 0, ?3)",
+                params![kind, payload, now_secs()],
+            )?;
+            Ok(self.conn.last_insert_rowid())
+        }
+    }
+
+    /// `atlas complete <id> --ok|--fail`: only IN_PROGRESS tasks are
+    /// accepted. Queues a `task_completed`/`task_failed` event under an
+    /// idempotency key and snapshots the checkpoint; the state change
+    /// itself happens in `tick_once`. Returns the queued event id.
+    pub fn finish_task(&self, id: &str, ok: bool, reason: &str) -> Result<i64> {
+        let task = self.require_task_row(id)?;
+        if task.state != TaskState::InProgress {
+            return Err(AtlasError::InvalidTransition(format!(
+                "task {id} is {}, only IN_PROGRESS work can complete",
+                task.state
+            )));
+        }
+        let (kind, payload, key) = if ok {
+            (
+                "task_completed",
+                format!("{{\"id\":\"{id}\"}}"),
+                format!("completed:{id}"),
+            )
+        } else {
+            let safe = reason.replace('\\', "\\\\").replace('"', "\\\"");
+            (
+                "task_failed",
+                format!("{{\"id\":\"{id}\",\"reason\":\"{safe}\"}}"),
+                format!("failed:{id}:attempt{}", task.attempts + 1),
+            )
+        };
+        let event_id = self.emit_event(kind, &payload, Some(&key))?;
+        self.snapshot_checkpoint()?;
+        Ok(event_id)
+    }
+
+    /// Queued (unprocessed) events in id order.
+    pub fn pending_events(&self) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, type, payload, idempotency_key, processed
+             FROM events WHERE processed = 0 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], event_from_row)?;
+        rows.collect::<std::result::Result<Vec<Event>, _>>()
+            .map_err(AtlasError::Db)
+    }
+
+    /// Number of queued (unprocessed) events.
+    pub fn pending_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events WHERE processed = 0", [], |r| {
+                r.get(0)
+            })?)
+    }
+
+    /// Current durable checkpoint, if any.
+    pub fn checkpoint(&self) -> Result<Option<Checkpoint>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT last_event_id, snapshot, updated_at FROM checkpoint WHERE id = 1",
+                [],
+                |r| {
+                    Ok(Checkpoint {
+                        last_event_id: r.get(0)?,
+                        snapshot: r.get(1)?,
+                        updated_at: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Consume every queued event once, in id order (REQ-F-009/010).
+    /// Each event is applied, marked processed, and checkpointed inside
+    /// one transaction: a crash replays at most the in-flight event, and
+    /// the idempotency key plus the processed flag make replays free of
+    /// double-execution. Watchdog-only callers run a single pass
+    /// (REQ-F-011).
+    pub fn tick_once(&self) -> Result<TickSummary> {
+        let mut summary = TickSummary {
+            last_event_id: self.checkpoint()?.map(|c| c.last_event_id).unwrap_or(0),
+            ..Default::default()
+        };
+        loop {
+            let next: Option<Event> = self
+                .conn
+                .query_row(
+                    "SELECT id, type, payload, idempotency_key, processed
+                     FROM events WHERE processed = 0 ORDER BY id LIMIT 1",
+                    [],
+                    event_from_row,
+                )
+                .optional()?;
+            let Some(ev) = next else { break };
+            self.conn.execute("BEGIN IMMEDIATE", [])?;
+            match self.apply_event(&ev) {
+                Ok(applied) => {
+                    self.conn.execute(
+                        "UPDATE events SET processed = 1 WHERE id = ?1",
+                        params![ev.id],
+                    )?;
+                    self.advance_checkpoint(ev.id)?;
+                    self.conn.execute("COMMIT", [])?;
+                    summary.processed += 1;
+                    summary.last_event_id = ev.id;
+                    match applied {
+                        Applied::Unlocked => summary.unlocked += 1,
+                        Applied::Retried => summary.retried += 1,
+                        Applied::Escalated => summary.escalated += 1,
+                        Applied::Skipped => summary.skipped += 1,
+                    }
+                }
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK", []);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Apply one queued event; called inside the per-event transaction.
+    fn apply_event(&self, ev: &Event) -> Result<Applied> {
+        match ev.kind.as_str() {
+            "task_completed" => {
+                let Some(id) = event_task_id(&ev.payload) else {
+                    return Ok(Applied::Skipped);
+                };
+                let task = self.require_task_row(&id);
+                let Ok(task) = task else {
+                    return Ok(Applied::Skipped);
+                };
+                match task.state {
+                    // Replay or legacy direct-complete: state is already
+                    // there, just make sure dependents are unlocked.
+                    TaskState::Completed => {
+                        self.unlock_dependents(&id, ev.id)?;
+                        Ok(Applied::Unlocked)
+                    }
+                    TaskState::InProgress => {
+                        self.set_state(&id, TaskState::Completed)?;
+                        self.unlock_dependents(&id, ev.id)?;
+                        Ok(Applied::Unlocked)
+                    }
+                    _ => Ok(Applied::Skipped),
+                }
+            }
+            "task_failed" => {
+                let Some(id) = event_task_id(&ev.payload) else {
+                    return Ok(Applied::Skipped);
+                };
+                let task = self.require_task_row(&id);
+                let Ok(task) = task else {
+                    return Ok(Applied::Skipped);
+                };
+                if task.state.is_terminal() {
+                    // Legacy direct-fail or replay: already settled.
+                    return Ok(Applied::Skipped);
+                }
+                if task.state != TaskState::InProgress {
+                    return Ok(Applied::Skipped);
+                }
+                let attempts = task.attempts + 1;
+                self.conn.execute(
+                    "UPDATE tasks SET attempts = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![attempts, now_secs(), id],
+                )?;
+                if attempts >= MAX_RETRIES {
+                    self.set_state(&id, TaskState::Failed)?;
+                    let payload = format!("{{\"id\":\"{id}\",\"attempts\":{attempts}}}");
+                    let key = format!("escalated:{}:{id}", ev.id);
+                    self.emit_event("task_escalated", &payload, Some(&key))?;
+                    Ok(Applied::Escalated)
+                } else {
+                    self.set_state(&id, TaskState::Ready)?;
+                    let payload = format!("{{\"id\":\"{id}\",\"attempt\":{attempts}}}");
+                    let key = format!("retried:{}:{id}", ev.id);
+                    self.emit_event("task_retried", &payload, Some(&key))?;
+                    Ok(Applied::Retried)
+                }
+            }
+            _ => Ok(Applied::Skipped),
+        }
+    }
+
+    /// Refresh every dependent; newly READY children get a `task_ready`
+    /// notice keyed by the consumed event (idempotent on replay).
+    fn unlock_dependents(&self, parent: &str, event_id: i64) -> Result<usize> {
+        let mut newly = 0;
+        for child in self.children_of(parent)? {
+            let before = child.state;
+            let after = self.refresh_state(&child.id)?;
+            if before != after && after == TaskState::Ready {
+                newly += 1;
+                let key = format!("ready:{event_id}:{}", child.id);
+                let payload = format!("{{\"id\":\"{}\"}}", child.id);
+                self.emit_event("task_ready", &payload, Some(&key))?;
+            }
+        }
+        Ok(newly)
+    }
+
+    /// Full task-state snapshot used by checkpoints (REQ-F-010).
+    fn snapshot_json(&self) -> Result<String> {
+        let tasks = self.list_tasks(None)?;
+        let mut parts = Vec::with_capacity(tasks.len());
+        for t in &tasks {
+            parts.push(format!(
+                "\"{}\":\"{}:{}\"",
+                t.id,
+                t.state.as_str(),
+                t.attempts
+            ));
+        }
+        Ok(format!("{{{}}}", parts.join(",")))
+    }
+
+    /// Persist a snapshot checkpoint without moving the event cursor
+    /// (used when queueing new work in `finish_task`).
+    fn snapshot_checkpoint(&self) -> Result<()> {
+        let last = self.checkpoint()?.map(|c| c.last_event_id).unwrap_or(0);
+        let snap = self.snapshot_json()?;
+        self.conn.execute(
+            "INSERT INTO checkpoint(id, last_event_id, snapshot, updated_at)
+             VALUES(1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               last_event_id = excluded.last_event_id,
+               snapshot = excluded.snapshot,
+               updated_at = excluded.updated_at",
+            params![last, snap, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Move the checkpoint cursor after consuming one event (called
+    /// inside the per-event transaction).
+    fn advance_checkpoint(&self, event_id: i64) -> Result<()> {
+        let snap = self.snapshot_json()?;
+        self.conn.execute(
+            "INSERT INTO checkpoint(id, last_event_id, snapshot, updated_at)
+             VALUES(1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               last_event_id = excluded.last_event_id,
+               snapshot = excluded.snapshot,
+               updated_at = excluded.updated_at",
+            params![event_id, snap, now_secs()],
+        )?;
+        Ok(())
     }
 
     // -- events / metrics --------------------------------------------------
@@ -553,6 +861,31 @@ impl Store {
     }
 }
 
+/// How one queued event was consumed by `tick_once`.
+enum Applied {
+    Unlocked,
+    Retried,
+    Escalated,
+    Skipped,
+}
+
+/// Task id carried in a `task_completed` / `task_failed` payload.
+fn event_task_id(payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    v.get("id")?.as_str().map(str::to_owned)
+}
+
+fn event_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
+    let processed: i64 = r.get(4)?;
+    Ok(Event {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        payload: r.get(2)?,
+        idempotency_key: r.get(3)?,
+        processed: processed != 0,
+    })
+}
+
 fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let state: String = r.get(3)?;
     Ok(Task {
@@ -561,8 +894,9 @@ fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         title: r.get(2)?,
         state: state.parse().unwrap_or(TaskState::Pending),
         agent: r.get(4)?,
-        created_at: r.get(5)?,
-        updated_at: r.get(6)?,
+        attempts: r.get(5)?,
+        created_at: r.get(6)?,
+        updated_at: r.get(7)?,
     })
 }
 
@@ -729,5 +1063,121 @@ mod tests {
         assert!(n >= 3, "events: {n}");
         store.set_session_status(&s, "active").expect("resume");
         assert_eq!(store.get_session(&s).expect("g").status, "active");
+    }
+
+    #[test]
+    fn dispatcher_unlocks_dependents_via_tick() {
+        let store = Store::open_in_memory().expect("open");
+        let s = store.create_session("chain").expect("session");
+        let l3 = store.create_task(&s, "L3", None, &[]).expect("l3");
+        let l4 = store.create_task(&s, "L4", None, &[&l3]).expect("l4");
+        assert_eq!(store.get_task(&l4).expect("g").state, TaskState::Blocked);
+        // Only READY work may start.
+        assert!(store.run_task(&l4).is_err());
+        store.run_task(&l3).expect("run l3");
+        // `complete` queues the event; state moves only on tick.
+        store.finish_task(&l3, true, "").expect("finish ok");
+        assert_eq!(store.get_task(&l3).expect("g").state, TaskState::InProgress);
+        assert_eq!(store.get_task(&l4).expect("g").state, TaskState::Blocked);
+        let sum = store.tick_once().expect("tick");
+        assert_eq!(sum.unlocked, 1);
+        assert_eq!(store.get_task(&l3).expect("g").state, TaskState::Completed);
+        assert_eq!(store.get_task(&l4).expect("g").state, TaskState::Ready);
+        // Only IN_PROGRESS tasks accept complete.
+        assert!(store.finish_task(&l4, true, "").is_err());
+        store.run_task(&l4).expect("run l4");
+        store.finish_task(&l4, true, "").expect("finish l4");
+        store.tick_once().expect("tick2");
+        assert_eq!(store.get_task(&l4).expect("g").state, TaskState::Completed);
+    }
+
+    #[test]
+    fn dispatcher_retry_then_escalates() {
+        let store = Store::open_in_memory().expect("open");
+        let s = store.create_session("flaky").expect("session");
+        let t = store.create_task(&s, "flaky work", None, &[]).expect("t");
+        for attempt in 1..=MAX_RETRIES {
+            store.run_task(&t).expect("run");
+            store.finish_task(&t, false, "boom").expect("finish fail");
+            let sum = store.tick_once().expect("tick");
+            let got = store.get_task(&t).expect("g");
+            if attempt < MAX_RETRIES {
+                assert_eq!(sum.retried, 1, "attempt {attempt}");
+                assert_eq!(got.state, TaskState::Ready);
+                assert_eq!(got.attempts, attempt);
+            } else {
+                assert_eq!(sum.escalated, 1);
+                assert_eq!(got.state, TaskState::Failed);
+                assert_eq!(got.attempts, MAX_RETRIES);
+            }
+        }
+        // Terminal tasks accept neither run nor complete.
+        assert!(store.run_task(&t).is_err());
+        assert!(store.finish_task(&t, false, "again").is_err());
+    }
+
+    #[test]
+    fn dispatcher_resume_has_no_double_run() {
+        // File-backed DB so close + reopen simulates `kill -9`.
+        let path = temp_path("resume");
+        let _ = std::fs::remove_file(&path);
+        let s;
+        let l3;
+        let l4;
+        {
+            let store = Store::open(&path).expect("open");
+            s = store.create_session("crash me").expect("session");
+            l3 = store.create_task(&s, "L3", None, &[]).expect("l3");
+            l4 = store.create_task(&s, "L4", None, &[&l3]).expect("l4");
+            store.run_task(&l3).expect("run");
+            store.finish_task(&l3, true, "").expect("finish");
+            // Duplicate emission under the same idempotency key is ignored.
+            let n_before: i64 = store
+                .conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .expect("count");
+            store.finish_task(&l3, true, "").expect("dup finish");
+            let n_after: i64 = store
+                .conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(n_before, n_after, "idempotency key must dedupe");
+            let sum = store.tick_once().expect("tick");
+            assert_eq!(sum.unlocked, 1);
+            assert_eq!(store.pending_count().expect("p"), 0);
+            // Checkpoint persisted: cursor + full snapshot.
+            let cp = store.checkpoint().expect("cp").expect("some");
+            assert!(cp.last_event_id > 0);
+            assert!(cp.snapshot.contains(&l3) && cp.snapshot.contains(&l4));
+        }
+        // "kill -9": drop without shutdown, reopen, tick again.
+        let before: String;
+        let cp_before: i64;
+        {
+            let store = Store::open(&path).expect("reopen");
+            assert_eq!(store.pending_count().expect("p"), 0);
+            before = format!(
+                "{:?}{:?}",
+                store.get_task(&l3).expect("g").state,
+                store.get_task(&l4).expect("g").state
+            );
+            cp_before = store.checkpoint().expect("cp").expect("some").last_event_id;
+            let sum = store.tick_once().expect("replay tick");
+            assert_eq!(sum.processed, 0, "nothing left to replay");
+            let after = format!(
+                "{:?}{:?}",
+                store.get_task(&l3).expect("g").state,
+                store.get_task(&l4).expect("g").state
+            );
+            assert_eq!(before, after, "replay must not move tasks");
+            assert_eq!(
+                store.checkpoint().expect("cp").expect("some").last_event_id,
+                cp_before,
+                "checkpoint cursor must not move on empty replay"
+            );
+            assert_eq!(store.get_task(&l3).expect("g").attempts, 0);
+        }
+        let _ = s;
+        std::fs::remove_file(&path).ok();
     }
 }

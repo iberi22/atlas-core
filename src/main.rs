@@ -53,6 +53,24 @@ enum Cmd {
     /// Task operations.
     #[command(subcommand)]
     Task(TaskCmd),
+    /// Move a READY task to IN_PROGRESS (only READY work may start).
+    Run { id: String },
+    /// Complete an IN_PROGRESS task: --ok queues task_completed,
+    /// --fail queues task_failed; state moves on `tick --once`.
+    Complete {
+        id: String,
+        #[arg(long)]
+        ok: bool,
+        #[arg(long)]
+        fail: bool,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Consume queued events once (watchdog-only single pass).
+    Tick {
+        #[arg(long)]
+        once: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -226,6 +244,61 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Run { id } => {
+            let task = store.run_task(id).map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&task)?);
+            } else {
+                println!("running {} [{}]", task.id, task.state);
+            }
+            Ok(())
+        }
+        Cmd::Complete {
+            id,
+            ok,
+            fail,
+            reason,
+        } => {
+            if *ok == *fail {
+                return Err(anyhow!("pass exactly one of --ok or --fail"));
+            }
+            let why = reason.as_deref().unwrap_or("");
+            let event = store
+                .finish_task(id, *ok, why)
+                .map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "task": id,
+                        "ok": ok,
+                        "event": event,
+                    }))?
+                );
+            } else if *ok {
+                println!("queued task_completed for {id} (event {event})");
+            } else {
+                println!("queued task_failed for {id} (event {event})");
+            }
+            Ok(())
+        }
+        Cmd::Tick { .. } => {
+            let sum = store.tick_once().map_err(anyhow::Error::new)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&sum)?);
+            } else {
+                println!(
+                    "tick: processed={} unlocked={} retried={} escalated={} skipped={} last_event={}",
+                    sum.processed,
+                    sum.unlocked,
+                    sum.retried,
+                    sum.escalated,
+                    sum.skipped,
+                    sum.last_event_id,
+                );
+            }
+            Ok(())
+        }
     }
 }
 

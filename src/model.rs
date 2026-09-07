@@ -76,6 +76,8 @@ pub struct Task {
     pub title: String,
     pub state: TaskState,
     pub agent: Option<String>,
+    /// Consecutive failure count driving bounded retry (REQ-F-009).
+    pub attempts: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -87,4 +89,34 @@ pub struct TaskNode {
     pub title: String,
     pub state: TaskState,
     pub children: Vec<TaskNode>,
+}
+
+/// One row of the append-only event log (REQ-F-002/009).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub id: i64,
+    pub kind: String,
+    pub payload: String,
+    pub idempotency_key: Option<String>,
+    pub processed: bool,
+}
+
+/// Durable dispatcher checkpoint: last consumed event plus a full
+/// task-state snapshot, resumable after `kill -9` (REQ-F-010).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub last_event_id: i64,
+    pub snapshot: String,
+    pub updated_at: i64,
+}
+
+/// Outcome of one `tick --once` pass over queued events.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TickSummary {
+    pub processed: usize,
+    pub unlocked: usize,
+    pub retried: usize,
+    pub escalated: usize,
+    pub skipped: usize,
+    pub last_event_id: i64,
 }
