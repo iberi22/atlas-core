@@ -15,7 +15,7 @@ use crate::model::{
 };
 
 /// Current schema revision tracked in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Max consecutive failures before a task escalates to FAILED (REQ-F-009).
 pub const MAX_RETRIES: i64 = 3;
@@ -116,6 +116,30 @@ CREATE TABLE IF NOT EXISTS forge_ci(
 );
 CREATE INDEX IF NOT EXISTS idx_forge_ci_head ON forge_ci(head_sha);
 CREATE INDEX IF NOT EXISTS idx_forge_ci_pr ON forge_ci(pr_id);
+CREATE TABLE IF NOT EXISTS status_catalog(
+    code INTEGER PRIMARY KEY,
+    slug TEXT NOT NULL,
+    category TEXT NOT NULL,
+    severity INTEGER NOT NULL,
+    description TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS state_transitions(
+    from_code INTEGER NOT NULL,
+    to_code INTEGER NOT NULL,
+    requires_evidence INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(from_code, to_code)
+);
+CREATE TABLE IF NOT EXISTS task_incidents(
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    code INTEGER NOT NULL,
+    severity INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    resolved INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_incidents_task ON task_incidents(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_incidents_sev ON task_incidents(resolved, severity);
 ";
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -271,6 +295,35 @@ impl Store {
                  );
                  CREATE INDEX IF NOT EXISTS idx_forge_ci_head ON forge_ci(head_sha);
                  CREATE INDEX IF NOT EXISTS idx_forge_ci_pr ON forge_ci(pr_id);",
+            )?;
+        }
+        if version < 5 {
+            // v4 -> v5: SODP deterministic status catalog, transitions and incidents (ADR-004)
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS status_catalog(
+                     code INTEGER PRIMARY KEY,
+                     slug TEXT NOT NULL,
+                     category TEXT NOT NULL,
+                     severity INTEGER NOT NULL,
+                     description TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS state_transitions(
+                     from_code INTEGER NOT NULL,
+                     to_code INTEGER NOT NULL,
+                     requires_evidence INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY(from_code, to_code)
+                 );
+                 CREATE TABLE IF NOT EXISTS task_incidents(
+                     id TEXT PRIMARY KEY,
+                     task_id TEXT NOT NULL REFERENCES tasks(id),
+                     code INTEGER NOT NULL,
+                     severity INTEGER NOT NULL,
+                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                     resolved INTEGER NOT NULL DEFAULT 0,
+                     created_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_task_incidents_task ON task_incidents(task_id);
+                 CREATE INDEX IF NOT EXISTS idx_task_incidents_sev ON task_incidents(resolved, severity);",
             )?;
         }
         self.conn
@@ -1393,6 +1446,66 @@ impl Store {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(AtlasError::Db)
+    }
+
+    /// Record a status transition adhering to SODP state machine (ADR-004).
+    pub fn record_status_transition(
+        &self,
+        task_id: &str,
+        from: crate::protocol::SwalStatusCode,
+        to: crate::protocol::SwalStatusCode,
+        evidence: Option<&str>,
+    ) -> Result<()> {
+        self.require_task_row(task_id)?;
+        if !crate::protocol::SwalStatusCode::can_transition(from, to) {
+            return Err(AtlasError::InvalidState(format!(
+                "Illegal SODP transition from {} ({}) to {} ({})",
+                from.slug(),
+                from.code(),
+                to.slug(),
+                to.code()
+            )));
+        }
+        let now = now_secs();
+        let payload = serde_json::json!({
+            "from_code": from.code(),
+            "from_slug": from.slug(),
+            "to_code": to.code(),
+            "to_slug": to.slug(),
+            "evidence": evidence.unwrap_or("")
+        });
+        self.emit_event("SODP_TRANSITION", &payload.to_string(), None)?;
+        self.conn.execute(
+            "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+            params![now, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record a critical or operational incident on a task (ADR-004).
+    pub fn record_task_incident(
+        &self,
+        task_id: &str,
+        code: crate::protocol::SwalStatusCode,
+        metadata_json: &str,
+    ) -> Result<String> {
+        self.require_task_row(task_id)?;
+        let id = new_id("inc_");
+        let now = now_secs();
+        let sev = match code {
+            crate::protocol::SwalStatusCode::IncSev0Critical => 0,
+            crate::protocol::SwalStatusCode::IncSev1Blocker => 1,
+            crate::protocol::SwalStatusCode::IncSev2Degraded => 2,
+            crate::protocol::SwalStatusCode::SecLeakDetected => 0,
+            crate::protocol::SwalStatusCode::OomCrash => 0,
+            _ => 3,
+        };
+        self.conn.execute(
+            "INSERT INTO task_incidents(id, task_id, code, severity, metadata_json, resolved, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            params![id, task_id, code.code(), sev, metadata_json, now],
+        )?;
+        Ok(id)
     }
 
     /// Snapshot del grafo, cargado UNA vez y reusado mientras los conteos de

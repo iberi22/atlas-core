@@ -11,6 +11,11 @@ default-members = [".", "wasm"]
 name = "atlas"
 path = "src/main.rs"
 
+[lib]
+name = "atlas"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }

@@ -6,6 +6,7 @@ pub mod estimator;
 pub mod forge;
 pub mod model;
 pub mod protocol;
+pub mod ffi;
 pub mod serve;
 pub mod store;
 pub mod verifier;
