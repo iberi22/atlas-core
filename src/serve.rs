@@ -76,12 +76,17 @@ pub fn resolve_bind(host: &str, port: u16, public: bool) -> crate::Result<Socket
     Ok(SocketAddr::new(ip, port))
 }
 
-/// Current dashboard state: every task plus recent event history.
+/// Current dashboard state: every task plus recent event history and SODP metadata (ADR-004).
 #[must_use]
 pub fn snapshot_json(store: &Store) -> String {
     let tasks = store.list_tasks(None).unwrap_or_default();
     let events = store.recent_events(HISTORY_LIMIT).unwrap_or_default();
-    json!({ "tasks": tasks, "events": events }).to_string()
+    json!({
+        "sodp_protocol": "4.0",
+        "schema_version": crate::store::SCHEMA_VERSION,
+        "tasks": tasks,
+        "events": events
+    }).to_string()
 }
 
 /// Serve forever on one listener; returns only on accept failure.
