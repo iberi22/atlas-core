@@ -52,6 +52,30 @@ fn topo_order_parents_always_first_on_larger_fixture() {
 }
 
 #[test]
+fn edge_cases_self_loop_dup_edges_implicit_nodes() {
+    // Self-loop is a cycle with a single member (byte-identical to the
+    // node/app.js mirror output).
+    let out = topo_order_json(r#"["a"]"#, r#"[["a","a"]]"#);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(v, serde_json::json!({ "error": "cycle detected among: a" }));
+
+    // Duplicate edges must not inflate indegrees.
+    assert_eq!(
+        topo_order_json(r#"["a","b"]"#, r#"[["b","a"],["b","a"]]"#),
+        r#"["a","b"]"#
+    );
+
+    // Ids appearing only in edges join as implicit nodes.
+    assert_eq!(
+        topo_order_json(r#"["a"]"#, r#"[["b","a"]]"#),
+        r#"["a","b"]"#
+    );
+
+    // Reachable through a cycle never reports `start` itself.
+    assert_eq!(reachable_json("a", r#"[["a","b"],["b","a"]]"#), r#"["b"]"#);
+}
+
+#[test]
 fn cycles_and_bad_input_report_error_object() {
     let out = topo_order_json(r#"["a","b"]"#, r#"[["a","b"],["b","a"]]"#);
     let v: serde_json::Value = serde_json::from_str(&out).expect("json");

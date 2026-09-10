@@ -310,6 +310,254 @@ pub fn draft_from_hits(goal: &str, hits: &[MemoryHit]) -> Vec<DraftTask> {
     out
 }
 
+/// External backlog import (H3): turn a local JSON backlog into a
+/// printable dry-run draft. Offline-first by construction: parsing and
+/// planning are pure (no network, no DB handle anywhere in this
+/// module), so a dry-run never writes; applying the plan is a separate
+/// explicit step outside this adapter (`wrote_db` stays false here).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternalBacklogItem {
+    pub title: String,
+    #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
+    pub depends_on: Vec<usize>,
+}
+
+/// One planned task with its stable index into the same import list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlannedImportTask {
+    pub index: usize,
+    pub title: String,
+    #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
+    pub depends_on: Vec<usize>,
+}
+
+/// Printable dry-run outcome. `wrote_db` is always false: this adapter
+/// prints what it *would* create and never persists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BacklogImportDraft {
+    pub tasks: Vec<PlannedImportTask>,
+    pub degraded: bool,
+    pub detail: String,
+    pub wrote_db: bool,
+}
+
+/// Parse an external backlog JSON string into validated items (no I/O).
+///
+/// Accepted envelopes (tolerant, EN + ES keys):
+/// - bare array of task objects
+/// - object holding the array under `tasks`, `backlog`, `results`,
+///   or `items`
+/// Per-item keys: `title` | `titulo` | `name`;
+/// `agent` | `agente` | `owner`;
+/// `depends_on` | `dependsOn` | `deps` | `depends-on` |
+/// `dependencies` | `dependencias`.
+///
+/// Validation: title must be non-empty after trimming; every dep must
+/// be an in-range index into the same list and never self-referential.
+pub fn parse_external_backlog(text: &str) -> Result<Vec<ExternalBacklogItem>, XavierError> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| XavierError::BadResponse(format!("invalid backlog json: {e}")))?;
+    let arr = value
+        .as_array()
+        .or_else(|| value.get("tasks").and_then(|v| v.as_array()))
+        .or_else(|| value.get("backlog").and_then(|v| v.as_array()))
+        .or_else(|| value.get("results").and_then(|v| v.as_array()))
+        .or_else(|| value.get("items").and_then(|v| v.as_array()))
+        .ok_or_else(|| {
+            XavierError::BadResponse(
+                "invalid backlog: expected an array or an object with tasks/backlog/results/items"
+                    .to_owned(),
+            )
+        })?;
+    let n = arr.len();
+    if n == 0 {
+        return Err(XavierError::BadResponse(
+            "invalid backlog: no tasks".to_owned(),
+        ));
+    }
+    let mut out = Vec::with_capacity(n);
+    for (i, item) in arr.iter().enumerate() {
+        if !item.is_object() {
+            return Err(XavierError::BadResponse(format!(
+                "invalid backlog: task {i} is not an object"
+            )));
+        }
+        let title = first_str(item, &["title", "titulo", "name"]);
+        if title.trim().is_empty() {
+            return Err(XavierError::BadResponse(format!(
+                "invalid backlog: task {i} has an empty title"
+            )));
+        }
+        let agent = first_str(item, &["agent", "agente", "owner"]);
+        let depends_on = parse_dep_list(item, i, n)?;
+        out.push(ExternalBacklogItem {
+            title: title.trim().to_owned(),
+            agent: agent.trim().to_owned(),
+            depends_on,
+        });
+    }
+    Ok(out)
+}
+
+fn first_str(item: &serde_json::Value, keys: &[&str]) -> String {
+    for key in keys {
+        if let Some(s) = item.get(*key).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return s.to_owned();
+            }
+        }
+    }
+    String::new()
+}
+
+fn parse_dep_list(
+    item: &serde_json::Value,
+    index: usize,
+    total: usize,
+) -> Result<Vec<usize>, XavierError> {
+    let raw = [
+        "depends_on",
+        "dependsOn",
+        "deps",
+        "depends-on",
+        "dependencies",
+        "dependencias",
+    ]
+    .iter()
+    .find_map(|k| item.get(*k));
+    let raw = match raw {
+        Some(v) => v,
+        None => return Ok(Vec::new()),
+    };
+    // A single number is shorthand for a one-element list.
+    if let Some(n) = raw.as_u64() {
+        return check_dep(index, total, n as usize).map(|d| vec![d]);
+    }
+    let arr = raw.as_array().ok_or_else(|| {
+        XavierError::BadResponse(format!(
+            "invalid backlog: task {index} deps must be an array of indices"
+        ))
+    })?;
+    let mut deps = Vec::with_capacity(arr.len());
+    for d in arr {
+        let n = d.as_u64().ok_or_else(|| {
+            XavierError::BadResponse(format!(
+                "invalid backlog: task {index} has a non-numeric dep"
+            ))
+        })?;
+        deps.push(check_dep(index, total, n as usize)?);
+    }
+    Ok(deps)
+}
+
+fn check_dep(index: usize, total: usize, dep: usize) -> Result<usize, XavierError> {
+    if dep >= total {
+        return Err(XavierError::BadResponse(format!(
+            "invalid backlog: task {index} dep {dep} out of range (0..{})",
+            total.saturating_sub(1)
+        )));
+    }
+    if dep == index {
+        return Err(XavierError::BadResponse(format!(
+            "invalid backlog: task {index} depends on itself"
+        )));
+    }
+    Ok(dep)
+}
+
+/// Assign stable indices to validated items. Pure: no network, no DB.
+pub fn plan_backlog_import(items: &[ExternalBacklogItem]) -> Vec<PlannedImportTask> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| PlannedImportTask {
+            index,
+            title: item.title.clone(),
+            agent: item.agent.clone(),
+            depends_on: item.depends_on.clone(),
+        })
+        .collect()
+}
+
+/// Render the printable dry-run borrador: one `would create` line per
+/// task plus an explicit no-write footer. Degraded drafts carry an
+/// honest `xavier: degraded mode (...)` header instead of grounding.
+pub fn render_import_dry_run(draft: &BacklogImportDraft) -> String {
+    let mut lines = Vec::with_capacity(draft.tasks.len() + 3);
+    if draft.degraded {
+        lines.push(format!("xavier: degraded mode ({})", draft.detail));
+        lines.push("note: draft is local-only, not grounded in xavier memory".to_owned());
+    } else {
+        lines.push(format!("xavier: {}", draft.detail));
+    }
+    lines.push(format!(
+        "import dry-run: {} task(s) (no DB write)",
+        draft.tasks.len()
+    ));
+    for task in &draft.tasks {
+        let agent = if task.agent.is_empty() {
+            "none"
+        } else {
+            task.agent.as_str()
+        };
+        let deps = if task.depends_on.is_empty() {
+            "none".to_owned()
+        } else {
+            task.depends_on
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        lines.push(format!(
+            "  [{}] would create '{}' agent={} deps={}",
+            task.index, task.title, agent, deps
+        ));
+    }
+    lines.push("result: 0 written (dry-run; nothing persisted)".to_owned());
+    lines.join("\n")
+}
+
+/// Build the import draft against a backend so the degraded flag is
+/// honest: Xavier down still yields the full local plan (`Ok`) marked
+/// `degraded=true`; only malformed JSON is an `Err`. Never writes DB.
+pub fn import_backlog_as_draft(
+    backend: &dyn XavierBackend,
+    json_text: &str,
+) -> Result<BacklogImportDraft, XavierError> {
+    let items = parse_external_backlog(json_text)?;
+    let tasks = plan_backlog_import(&items);
+    let status = backend.check_status();
+    let n = tasks.len();
+    let (degraded, detail) = if status.degraded || !status.reachable {
+        (
+            true,
+            format!(
+                "degraded: xavier unreachable at {}: {}. draft is local-only ({} task(s)), nothing written",
+                status.base_url, status.detail, n
+            ),
+        )
+    } else {
+        (
+            false,
+            format!(
+                "grounded against xavier at {} ({} task(s) planned, nothing written)",
+                status.base_url, n
+            ),
+        )
+    };
+    Ok(BacklogImportDraft {
+        tasks,
+        degraded,
+        detail,
+        wrote_db: false,
+    })
+}
+
 /// Minimal blocking HTTP/1.0 client (no new deps): one connection per
 /// call, `Connection: close`, whole call bounded by the config timeout.
 fn http_request(
@@ -538,5 +786,121 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "s1");
         assert_eq!(hits[0].path, "a/b.md");
+    }
+
+    // ---- H3 external backlog import: dry-run draft + honest degraded ----
+
+    /// Same 3-task fixture used for the file-level demo (/tmp/xavier-backlog-3.json).
+    const THREE_TASK_BACKLOG: &str = r#"[
+        {"titulo": "Disenar esquema de sesiones", "agente": "hermes", "deps": []},
+        {"titulo": "Implementar DAG de tareas", "agente": "codex", "deps": [0]},
+        {"titulo": "Verificar cierre de sprint", "agente": "jules", "deps": [1]}
+    ]"#;
+
+    #[test]
+    fn import_parses_spanish_three_task_json() {
+        let items = parse_external_backlog(THREE_TASK_BACKLOG).expect("parse backlog");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].title, "Disenar esquema de sesiones");
+        assert_eq!(items[0].agent, "hermes");
+        assert!(items[0].depends_on.is_empty());
+        assert_eq!(items[1].depends_on, vec![0]);
+        assert_eq!(items[2].agent, "jules");
+        assert_eq!(items[2].depends_on, vec![1]);
+    }
+
+    #[test]
+    fn import_accepts_envelope_and_english_keys() {
+        let wrapped = r#"{"tasks": [
+            {"title": "A", "agent": "hermes"},
+            {"title": "B", "agent": "codex", "depends_on": [0]}
+        ]}"#;
+        let items = parse_external_backlog(wrapped).expect("parse wrapped");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].depends_on, vec![0]);
+    }
+
+    #[test]
+    fn import_dry_run_prints_plan_without_db_write() {
+        let draft = import_backlog_as_draft(
+            &StubBackend::reachable_with(serde_json::Value::Null),
+            THREE_TASK_BACKLOG,
+        )
+        .expect("draft");
+        assert!(!draft.degraded);
+        assert!(!draft.wrote_db);
+        assert_eq!(draft.tasks.len(), 3);
+        let out = render_import_dry_run(&draft);
+        assert!(out.contains("no DB write"));
+        assert!(out.contains("would create 'Disenar esquema de sesiones'"));
+        assert!(out.contains("agent=hermes"));
+        assert!(out.contains("deps=0"));
+        assert!(out.contains("0 written"));
+    }
+
+    #[test]
+    fn import_degraded_honest_with_xavier_down() {
+        // Stub path.
+        let draft = import_backlog_as_draft(&StubBackend::unreachable(), THREE_TASK_BACKLOG)
+            .expect("draft");
+        assert!(draft.degraded);
+        assert!(!draft.wrote_db);
+        assert_eq!(draft.tasks.len(), 3, "degraded keeps the full local plan");
+        assert!(draft.detail.contains("unreachable"));
+        let out = render_import_dry_run(&draft);
+        assert!(out.contains("degraded mode"));
+        assert!(out.contains("local-only"));
+        assert!(out.contains("would create 'Implementar DAG de tareas'"));
+        // Real HTTP path against a closed port: same honest answer, still Ok.
+        let http = HttpBackend::new(closed_port_config());
+        let draft = import_backlog_as_draft(&http, THREE_TASK_BACKLOG).expect("draft");
+        assert!(draft.degraded);
+        assert_eq!(draft.tasks.len(), 3);
+    }
+
+    #[test]
+    fn import_rejects_empty_title_and_bad_dep() {
+        let no_title = r#"[{"agent": "hermes", "deps": []}]"#;
+        assert!(matches!(
+            parse_external_backlog(no_title),
+            Err(XavierError::BadResponse(_))
+        ));
+        let bad_dep = r#"[
+            {"title": "A", "deps": [5]},
+            {"title": "B", "deps": []}
+        ]"#;
+        assert!(matches!(
+            parse_external_backlog(bad_dep),
+            Err(XavierError::BadResponse(_))
+        ));
+        let self_dep = r#"[{"title": "A", "deps": [0]}]"#;
+        assert!(matches!(
+            parse_external_backlog(self_dep),
+            Err(XavierError::BadResponse(_))
+        ));
+    }
+
+    /// Demo test: prints the dry-run borrador with Xavier up and the
+    /// honest degraded borrador with Xavier down. Run with
+    /// `cargo test --offline demo_three_task -- --nocapture`.
+    #[test]
+    fn demo_three_task_backlog_prints_dry_run_and_degraded() {
+        let online = import_backlog_as_draft(
+            &StubBackend::reachable_with(serde_json::Value::Null),
+            THREE_TASK_BACKLOG,
+        )
+        .expect("demo parse");
+        println!(
+            "--- dry-run (xavier up) ---\n{}",
+            render_import_dry_run(&online)
+        );
+        let offline = import_backlog_as_draft(&StubBackend::unreachable(), THREE_TASK_BACKLOG)
+            .expect("demo parse");
+        println!(
+            "--- dry-run (xavier down, degraded) ---\n{}",
+            render_import_dry_run(&offline)
+        );
+        assert!(!online.degraded && offline.degraded);
+        assert!(!online.wrote_db && !offline.wrote_db);
     }
 }
