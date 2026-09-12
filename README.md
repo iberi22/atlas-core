@@ -12,7 +12,6 @@ is ready, what is blocked, and what counts as done.
 - Status: F0 scaffolding. See `docs/BRD.md`, `docs/USER_STORIES.md`, `docs/adr/`.
 - Source of truth for progress: `.gitcore/features.json` (promoted only by
   green verification runs, never by hand).
-- Private SaaS plane (managed validation, QA, deploy service): separate repo.
 
 ## Layout
 

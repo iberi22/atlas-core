@@ -17,7 +17,6 @@ Cargo.lock
 *.log
 .DS_Store
 
-
-# Added by cargo
-
-/target
+# Harness and local caches
+.hermes/
+.atl/

@@ -63,19 +63,11 @@ Stories: C-010. Feature: feat-xavier-adapter.
 Branch: `mod/xavier-adapter`. Issue: ATLAS-09.
 
 ## L9 Distribution — WASM+Node unit
-Goal: Atlas runs on shared/CPanel and low-spec boxes as the free tier.
+Goal: Atlas runs on shared/CPanel and low-spec environments.
 Scope: WASM compute module, thin Node wrapper, Node-side SQLite,
 parity native/WASM/Workers, memory budget.
 Stories: C-014. Feature: feat-wasm-node.
 Branch: `mod/wasm-node`. Issue: ATLAS-04.
-
-## L10 SaaS plane (private repo)
-Goal: managed validation/QA/deploy for customers.
-Scope: auth+CLI link, remote validation, ephemeral envs, assisted QA,
-external feedback, enterprise dashboard. F3 only.
-Stories: S-001..S-005. Features: feat-saas-*.
-Branches: `saas/auth`, `saas/validate`, `saas/qa`, `saas/feedback`,
-`saas/dashboard`. Issues: SAAS-01 (auth+link), SAAS-02 (validate pipe).
 
 ## Branching rule
 
