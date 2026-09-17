@@ -1,13 +1,10 @@
 // `atlas` CLI: sessions, task DAG, and tree render (REQ-F-003/005).
-use atlas::{Store, model, store};
+use atlas::{Store, model};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-
-use atlas::model::TaskNode;
 
 /// Atlas: autonomous long-horizon task execution, offline-first.
 #[derive(Debug, Parser)]
@@ -29,6 +26,9 @@ enum Cmd {
     Start {
         #[arg(long)]
         goal: String,
+        /// Automatically draft initial tasks grounded in Xavier memory.
+        #[arg(long)]
+        draft_xavier: bool,
     },
     /// Stop a session (history is kept).
     Stop {
@@ -45,10 +45,20 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Render the dependency tree of a session.
+    /// Render the dependency tree of a session (optionally filtered by project).
     Tree {
         #[arg(long)]
         session: Option<String>,
+        /// Filter tree to a specific project (e.g. xavier, gestalt, shelf, atlas-core).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Run the Atlas-Xavier project & feature evaluation pipeline.
+    Evaluate {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Task operations.
     #[command(subcommand)]
@@ -156,6 +166,18 @@ enum Cmd {
     /// degraded-first: every subcommand exits 0 with Xavier down.
     #[command(subcommand)]
     Xavier(XavierCmd),
+    /// Watch the Gestalt Event Bus (:8081) and automatically promote/verify tasks.
+    Watch {
+        /// Gestalt bus URL (default: http://127.0.0.1:8081).
+        #[arg(long, default_value = "http://127.0.0.1:8081")]
+        bus: String,
+        /// Poll interval in milliseconds.
+        #[arg(long, default_value_t = 2000)]
+        interval_ms: u64,
+        /// Exit after single poll pass.
+        #[arg(long)]
+        once: bool,
+    },
 }
 
 /// Xavier subcommands: liveness, task grounding, backlog drafting.
@@ -275,9 +297,29 @@ fn main() -> Result<()> {
 
 fn run(store: &Store, cli: &Cli) -> Result<()> {
     match &cli.cmd {
-        Cmd::Start { goal } => {
+        Cmd::Start { goal, draft_xavier } => {
             let id = store.create_session(goal).map_err(anyhow::Error::new)?;
             let sess = store.get_session(&id).map_err(anyhow::Error::new)?;
+            if *draft_xavier {
+                use atlas::xavier::{HttpBackend, XavierBackend, XavierConfig, draft_from_hits};
+                let backend = HttpBackend::new(XavierConfig::from_env());
+                let hits = backend.search(goal, 5).unwrap_or_default();
+                let draft = draft_from_hits(goal, &hits);
+                let mut created_ids = Vec::new();
+                for item in &draft {
+                    let dep_ids: Vec<&str> = item
+                        .depends_on
+                        .iter()
+                        .filter_map(|&idx| created_ids.get(idx).map(|s: &String| s.as_str()))
+                        .collect();
+                    if let Ok(task_id) = store.create_task(&id, &item.title, None, &dep_ids) {
+                        created_ids.push(task_id);
+                    }
+                }
+                if !cli.json {
+                    println!("🌱 Auto-drafted {} tasks grounded in Xavier into session {}", created_ids.len(), sess.id);
+                }
+            }
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&sess)?);
             } else {
@@ -336,15 +378,38 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Tree { session } => {
+        Cmd::Tree { session, project } => {
             let s = resolve_session(store, session)?;
-            let roots = build_tree(store, &s).map_err(anyhow::Error::new)?;
+            let roots = atlas::tree::build_tree(store, &s, project.as_deref()).map_err(anyhow::Error::new)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&roots)?);
             } else {
-                for r in &roots {
-                    print_node(r, 0);
+                if let Some(p) = project {
+                    println!("=== [Task Tree: {} | Session: {}] ===", p.to_uppercase(), s);
                 }
+                for r in &roots {
+                    atlas::tree::print_node(r, 0);
+                }
+            }
+            Ok(())
+        }
+        Cmd::Evaluate { session, project } => {
+            let s = resolve_session(store, session)?;
+            // Resolve the evaluator from $ATLAS_EVALUATOR or the working
+            // directory. Never hardcode a machine-specific absolute path: this
+            // repository is public.
+            let script = std::env::var("ATLAS_EVALUATOR")
+                .unwrap_or_else(|_| "scripts/atlas_xavier_evaluator.py".to_string());
+            let mut cmd = std::process::Command::new("python3");
+            cmd.arg(&script)
+               .arg("--db").arg(&cli.db)
+               .arg("--session").arg(&s);
+            if let Some(p) = project {
+                cmd.arg("--project").arg(p);
+            }
+            let status = cmd.status().context("Failed to run atlas_xavier_evaluator.py")?;
+            if !status.success() {
+                bail!("Evaluator script failed with status {}", status);
             }
             Ok(())
         }
@@ -756,7 +821,135 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Xavier(sub) => run_xavier(sub, cli.json),
+        Cmd::Watch { bus, interval_ms, once } => run_watch(store, bus, *interval_ms, *once, cli.json),
     }
+}
+
+/// Watch the Gestalt Event Bus, query new events with cursor pagination,
+/// and advance tasks according to SODP status codes and events.
+fn run_watch(
+    store: &Store,
+    bus_url: &str,
+    interval_ms: u64,
+    once: bool,
+    as_json: bool,
+) -> Result<()> {
+    use std::io::Read;
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let timeout = Duration::from_millis(1500);
+
+    // Helper: fetch events via HTTP GET
+    let fetch_events = |after_seq: Option<i64>| -> Result<serde_json::Value> {
+        let clean = bus_url.trim_end_matches('/');
+        let path = match after_seq {
+            Some(seq) => format!("/api/events?after_seq={seq}&limit=50"),
+            None => "/api/events?limit=50".to_string(),
+        };
+
+        // Extract host and port
+        let without_proto = clean
+            .strip_prefix("http://")
+            .or_else(|| clean.strip_prefix("https://"))
+            .unwrap_or(clean);
+        let mut parts = without_proto.split(':');
+        let host = parts.next().unwrap_or("127.0.0.1");
+        let port = parts.next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(8081);
+
+        let addr_str = format!("{host}:{port}");
+        let addrs: Vec<std::net::SocketAddr> = addr_str
+            .to_socket_addrs()
+            .map_err(|e| anyhow!("Address resolution failed: {e}"))?
+            .collect();
+        let target = addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("No address found for {addr_str}"))?;
+
+        let mut stream = TcpStream::connect_timeout(&target, timeout)
+            .map_err(|e| anyhow!("Failed to connect to Gestalt bus at {clean}: {e}"))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+
+        let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        std::io::Write::write_all(&mut stream, req.as_bytes())?;
+
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf)?;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+
+        let body_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+        let body = &text[body_start..];
+        let val: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| anyhow!("Failed to parse Gestalt bus events JSON: {e}"))?;
+        Ok(val)
+    };
+
+    println!("👀 Watching Gestalt Event Bus at {bus_url}...");
+    let mut cursor: Option<i64> = None;
+
+    loop {
+        match fetch_events(cursor) {
+            Ok(data) => {
+                if let Some(events) = data.get("events").and_then(|e| e.as_array()) {
+                    for ev in events {
+                        // Bus events expose `agent_id` at the top level and nest the
+                        // producer's original fields inside a JSON-encoded `payload`
+                        // string. Read the nested values first, then fall back to the
+                        // flat ones, so both shapes resolve instead of yielding
+                        // "unknown"/None for every event.
+                        let payload: serde_json::Value = ev
+                            .get("payload")
+                            .and_then(|p| p.as_str())
+                            .and_then(|p| serde_json::from_str(p).ok())
+                            .unwrap_or(serde_json::Value::Null);
+
+                        let agent = payload
+                            .get("agent")
+                            .and_then(|a| a.as_str())
+                            .or_else(|| ev.get("agent_id").and_then(|a| a.as_str()))
+                            .or_else(|| ev.get("agent").and_then(|a| a.as_str()))
+                            .unwrap_or("unknown");
+                        let ev_type = ev.get("event_type").and_then(|t| t.as_str()).unwrap_or("event");
+                        let summary = payload
+                            .get("summary")
+                            .and_then(|s| s.as_str())
+                            .or_else(|| ev.get("summary").and_then(|s| s.as_str()))
+                            .unwrap_or("");
+                        let state = payload
+                            .get("state")
+                            .and_then(|s| s.as_str())
+                            .or_else(|| ev.get("state").and_then(|s| s.as_str()));
+
+                        if !as_json {
+                            println!("📡 [{agent}] {ev_type} {state:?}: {summary}");
+                        }
+
+                        // When an agent completes or a run finishes, trigger tick_once to promote ready tasks
+                        if ev_type == "run_finished" || state == Some("Success") {
+                            let _ = store.tick_once();
+                        }
+                    }
+                }
+                if let Some(next) = data.get("next_seq").and_then(|s| s.as_i64()) {
+                    cursor = Some(next);
+                }
+            }
+            Err(err) => {
+                if !as_json {
+                    eprintln!("⚠️  Gestalt bus poll error: {err}");
+                }
+            }
+        }
+
+        if once {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+
+    Ok(())
 }
 
 /// Xavier adapter commands (REQ-F-019). Degraded-first: unreachable
@@ -877,73 +1070,6 @@ fn resolve_session(store: &Store, explicit: &Option<String>) -> Result<String> {
         .ok_or_else(|| anyhow!("no session yet; run `atlas start --goal \"...\"` first"))
 }
 
-/// Forest of task trees for a session (roots = tasks without parents).
-fn build_tree(store: &Store, session: &str) -> store::Result<Vec<TaskNode>> {
-    let tasks = store.list_tasks(Some(session))?;
-    let mut meta: HashMap<String, (String, model::TaskState)> = HashMap::with_capacity(tasks.len());
-    for t in &tasks {
-        meta.insert(t.id.clone(), (t.title.clone(), t.state));
-    }
-    let mut child_ids: HashMap<String, Vec<String>> = HashMap::new();
-    let mut roots: Vec<String> = Vec::new();
-    for t in &tasks {
-        let parents = store.parents_of(&t.id)?;
-        if parents.is_empty() {
-            roots.push(t.id.clone());
-        }
-        for par in parents {
-            if meta.contains_key(&par.id) {
-                child_ids.entry(par.id).or_default().push(t.id.clone());
-            }
-        }
-    }
-    for kids in child_ids.values_mut() {
-        kids.sort();
-    }
-    roots.sort();
-    let mut visited: HashSet<String> = HashSet::with_capacity(tasks.len());
-    Ok(roots
-        .into_iter()
-        .filter_map(|r| to_node(&meta, &child_ids, &r, &mut visited))
-        .collect())
-}
-
-fn to_node(
-    meta: &HashMap<String, (String, model::TaskState)>,
-    child_ids: &HashMap<String, Vec<String>>,
-    id: &str,
-    visited: &mut HashSet<String>,
-) -> Option<TaskNode> {
-    if !visited.insert(id.to_owned()) {
-        return None;
-    }
-    let (title, state) = meta
-        .get(id)
-        .cloned()
-        .unwrap_or_else(|| (String::new(), model::TaskState::Pending));
-    let mut kids: Vec<TaskNode> = child_ids
-        .get(id)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|cid| to_node(meta, child_ids, cid, visited))
-        .collect();
-    kids.sort_by(|a, b| a.id.cmp(&b.id));
-    Some(TaskNode {
-        id: id.to_owned(),
-        title,
-        state,
-        children: kids,
-    })
-}
-
-fn print_node(n: &TaskNode, depth: usize) {
-    println!("{}{} [{}] {}", "  ".repeat(depth), n.id, n.state, n.title);
-    for c in &n.children {
-        print_node(c, depth + 1);
-    }
-}
-
 /// One-line per-task estimate with its history source and actual, if any.
 fn print_estimate(e: &atlas::estimator::TaskEstimate) {
     let src = if e.from_history {
@@ -990,6 +1116,8 @@ fn print_rollup(r: &atlas::estimator::Rollup) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atlas::model::TaskNode;
+    use atlas::tree::build_tree;
 
     fn count_occurrences(nodes: &[TaskNode], id: &str) -> usize {
         nodes
@@ -1016,7 +1144,7 @@ mod tests {
             .expect("task D");
         store.add_dependency(&d, &c).expect("D depende de C");
 
-        let roots = build_tree(&store, &session).expect("tree");
+        let roots = build_tree(&store, &session, None).expect("tree");
         assert_eq!(
             count_occurrences(&roots, &d),
             1,
@@ -1025,5 +1153,30 @@ mod tests {
         assert_eq!(count_occurrences(&roots, &a), 1);
         assert_eq!(count_occurrences(&roots, &b), 1);
         assert_eq!(count_occurrences(&roots, &c), 1);
+    }
+
+    #[test]
+    fn test_watch_promotes_on_run_finished() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let session = store.create_session("watch test").expect("session");
+        let a = store.create_task(&session, "A", None, &[]).expect("task A");
+        assert_eq!(store.get_task(&a).unwrap().state, model::TaskState::Ready);
+
+        // Advance task A to in_progress
+        store.run_task(&a).expect("run task A");
+        assert_eq!(store.get_task(&a).unwrap().state, model::TaskState::InProgress);
+
+        // Verifier gate: DoD + Evidence
+        store.dod_add(&a, "done").expect("dod");
+        store.dod_check(&a, 1).expect("check");
+        store.evidence_add(&a, "proof").expect("ev");
+
+        // Queue completion
+        store.finish_task(&a, true, "done").expect("finish task");
+
+        // Simulating run_watch event trigger: executing tick_once
+        let sum = store.tick_once().expect("tick once");
+        assert_eq!(sum.processed, 4);
+        assert_eq!(store.get_task(&a).unwrap().state, model::TaskState::Completed);
     }
 }
