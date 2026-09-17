@@ -16,7 +16,6 @@ Cargo.lock
 # Runtime
 *.log
 .DS_Store
-
 # Harness and local caches
 .hermes/
 .atl/
@@ -39,6 +38,7 @@ Cargo.lock
 .gitcore/chronicles/
 .gitcore/waves/
 .gitcore/sdd/
+.gitcore/releases/
 .gitcore/issues/
 .gitcore/features.details/
 .gitcore/CONTEXT_LOG.md
@@ -58,6 +58,7 @@ Cargo.lock
 .atl/
 .gestalt/
 .jules/
+.xavier/
 .xavier-backups/
 .skill-registry.cache.json
 
