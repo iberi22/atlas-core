@@ -343,7 +343,7 @@ impl Store {
                      session_id TEXT NOT NULL REFERENCES sessions(id),
                      title TEXT NOT NULL,
                      state TEXT NOT NULL CHECK(state IN (
-                         'BLOCKED', 'READY', 'IN_PROGRESS', 'COMPLETED', 'FAILED'
+                         'PENDING', 'BLOCKED', 'READY', 'IN_PROGRESS', 'COMPLETED', 'FAILED'
                      )),
                      agent TEXT,
                      attempts INTEGER NOT NULL DEFAULT 0,
