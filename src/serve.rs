@@ -105,16 +105,71 @@ pub fn build_response(status: &str, ctype: &str, body: &[u8]) -> Vec<u8> {
     [head.as_bytes(), body].concat()
 }
 
+/// Fetch recent events from Gestalt Event Bus (127.0.0.1:8081) if reachable.
+fn fetch_gestalt_bus_events() -> Vec<serde_json::Value> {
+    use std::io::Read;
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &"127.0.0.1:8081".parse().unwrap(),
+        Duration::from_millis(200),
+    ) else {
+        return Vec::new();
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    let req = "GET /api/events?limit=30 HTTP/1.1\r\nHost: 127.0.0.1:8081\r\nConnection: close\r\n\r\n";
+    if stream.write_all(req.as_bytes()).is_err() {
+        return Vec::new();
+    }
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    let s = String::from_utf8_lossy(&resp);
+    if let Some((_, body)) = s.split_once("\r\n\r\n") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(arr) = v.get("events").and_then(|e| e.as_array()) {
+                return arr.clone();
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Current dashboard state: every task plus recent event history and SODP metadata (ADR-004).
 #[must_use]
 pub fn snapshot_json(store: &Store) -> String {
     let tasks = store.list_tasks(None).unwrap_or_default();
     let events = store.recent_events(HISTORY_LIMIT).unwrap_or_default();
+    let gestalt_events = fetch_gestalt_bus_events();
+    
+    // Enrich tasks with DoD progress
+    let enriched_tasks: Vec<serde_json::Value> = tasks
+        .into_iter()
+        .map(|t| {
+            let dod = store.dod_list(&t.id).unwrap_or_default();
+            let dod_total = dod.len();
+            let dod_checked = dod.iter().filter(|i| i.checked).count();
+            let evidence_count = store.evidence_list(&t.id).map(|e| e.len()).unwrap_or(0);
+            json!({
+                "id": t.id,
+                "session_id": t.session_id,
+                "title": t.title,
+                "state": t.state,
+                "agent": t.agent,
+                "attempts": t.attempts,
+                "created_at": t.created_at,
+                "updated_at": t.updated_at,
+                "dod_total": dod_total,
+                "dod_checked": dod_checked,
+                "evidence_count": evidence_count
+            })
+        })
+        .collect();
+
     json!({
         "sodp_protocol": "4.0",
         "schema_version": crate::store::SCHEMA_VERSION,
-        "tasks": tasks,
-        "events": events
+        "tasks": enriched_tasks,
+        "events": events,
+        "gestalt_events": gestalt_events
     }).to_string()
 }
 
@@ -201,7 +256,140 @@ fn handle_connection(mut stream: TcpStream, db: &Path) {
         }
         return;
     }
+    if path == "/api/projects" || path.starts_with("/api/projects?") {
+        if let Ok(store) = Store::open(db) {
+            if let Ok(projects) = crate::tree::get_projects_summary(&store, None) {
+                let json = serde_json::to_string(&projects).unwrap_or_else(|_| "[]".to_string());
+                respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+                return;
+            }
+        }
+        respond(&mut stream, "500 Internal Error", "text/plain", b"store error");
+        return;
+    }
+    if path == "/api/tree" || path.starts_with("/api/tree?") {
+        if let Ok(store) = Store::open(db) {
+            let session = store.latest_session().ok().flatten().map(|s| s.id).unwrap_or_else(|| "default".to_string());
+            let proj = extract_query_param(&path, "project");
+            if let Ok(tree) = crate::tree::build_tree(&store, &session, proj.as_deref()) {
+                let json = serde_json::to_string(&tree).unwrap_or_else(|_| "[]".to_string());
+                respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+                return;
+            }
+        }
+        respond(&mut stream, "500 Internal Error", "text/plain", b"store error");
+        return;
+    }
+    if path == "/api/tasks" || path.starts_with("/api/tasks?") {
+        if let Ok(store) = Store::open(db) {
+            let proj = extract_query_param(&path, "project");
+            let tasks = store.list_tasks(None).unwrap_or_default();
+            let filtered: Vec<_> = if let Some(ref p) = proj {
+                tasks.into_iter().filter(|t| crate::tree::matches_project(&t.title, &t.id, p)).collect()
+            } else {
+                tasks
+            };
+            let enriched: Vec<serde_json::Value> = filtered
+                .into_iter()
+                .map(|t| {
+                    let dod = store.dod_list(&t.id).unwrap_or_default();
+                    let dod_total = dod.len();
+                    let dod_checked = dod.iter().filter(|i| i.checked).count();
+                    let evidence_count = store.evidence_list(&t.id).map(|e| e.len()).unwrap_or(0);
+                    serde_json::json!({
+                        "id": t.id,
+                        "session_id": t.session_id,
+                        "title": t.title,
+                        "state": t.state,
+                        "agent": t.agent,
+                        "attempts": t.attempts,
+                        "created_at": t.created_at,
+                        "updated_at": t.updated_at,
+                        "dod_total": dod_total,
+                        "dod_checked": dod_checked,
+                        "evidence_count": evidence_count
+                    })
+                })
+                .collect();
+            let json = serde_json::to_string(&enriched).unwrap_or_else(|_| "[]".to_string());
+            respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+            return;
+        }
+        respond(&mut stream, "500 Internal Error", "text/plain", b"store error");
+        return;
+    }
+    if path == "/api/task-detail" || path.starts_with("/api/task-detail?") {
+        if let Ok(store) = Store::open(db) {
+            if let Some(task_id) = extract_query_param(&path, "id") {
+                if let Ok(task) = store.get_task(&task_id) {
+                    let dod = store.dod_list(&task.id).unwrap_or_default();
+                    let evidence = store.evidence_list(&task.id).unwrap_or_default();
+                    let parents = store.parents_of(&task.id).unwrap_or_default();
+                    let children = store.children_of(&task.id).unwrap_or_default();
+                    let payload = serde_json::json!({
+                        "task": task,
+                        "dod_items": dod,
+                        "evidence": evidence,
+                        "parents": parents,
+                        "children": children,
+                    });
+                    let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+                    respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+                    return;
+                }
+            }
+        }
+        respond(&mut stream, "404 Not Found", "text/plain", b"task not found");
+        return;
+    }
+    if path == "/api/llm-context" || path.starts_with("/api/llm-context?") {
+        if let Ok(store) = Store::open(db) {
+            let session = store.latest_session().ok().flatten().map(|s| s.id).unwrap_or_else(|| "default".to_string());
+            let proj = extract_query_param(&path, "project").unwrap_or_else(|| "ATLAS-CORE".to_string());
+            let tree = crate::tree::build_tree(&store, &session, Some(&proj)).unwrap_or_default();
+            let tasks = store.list_tasks(Some(&session)).unwrap_or_default();
+            let proj_tasks: Vec<_> = tasks.into_iter().filter(|t| crate::tree::matches_project(&t.title, &t.id, &proj)).collect();
+            let total = proj_tasks.len();
+            let completed = proj_tasks.iter().filter(|t| t.state == crate::model::TaskState::Completed).count();
+            let ready = proj_tasks.iter().filter(|t| t.state == crate::model::TaskState::Ready).count();
+            let in_prog = proj_tasks.iter().filter(|t| t.state == crate::model::TaskState::InProgress).count();
+            let blocked = total.saturating_sub(completed + ready + in_prog);
+            
+            let payload = serde_json::json!({
+                "project": proj.to_uppercase(),
+                "session": session,
+                "total_tasks": total,
+                "summary": {
+                    "completed": completed,
+                    "ready": ready,
+                    "in_progress": in_prog,
+                    "blocked_or_pending": blocked,
+                    "progress_pct": if total > 0 { (completed as f64 / total as f64) * 100.0 } else { 0.0 }
+                },
+                "dag_tree": tree,
+                "instructions_for_llm": "Focus on READY tasks whose upstream dependencies are completed. Update state via atlas run / complete."
+            });
+            let json = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
+            respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+            return;
+        }
+        respond(&mut stream, "500 Internal Error", "text/plain", b"store error");
+        return;
+    }
     respond(&mut stream, "404 Not Found", "text/plain", b"not found");
+}
+
+fn extract_query_param(path: &str, param: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let k = kv.next()?;
+        let v = kv.next().unwrap_or("");
+        if k == param {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 /// Stream replaying already-read handshake bytes, then the socket.
