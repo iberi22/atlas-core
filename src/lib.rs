@@ -9,6 +9,7 @@ pub mod protocol;
 pub mod ffi;
 pub mod serve;
 pub mod store;
+pub mod tree;
 pub mod verifier;
 pub mod xavier;
 
@@ -18,4 +19,5 @@ pub use model::{
     TaskNode, TaskState, TickSummary, VerifyReport,
 };
 pub use store::{SCHEMA_VERSION, Store};
+pub use tree::{build_tree, matches_project, print_node, ProjectSummary};
 pub use verifier::{CommandReviewer, ReviewDecision, Reviewer, StubReviewer};
