@@ -334,6 +334,16 @@ impl Store {
             // SQLite has no `ALTER TABLE ... ADD CONSTRAINT`, so the canonical way to
             // add a CHECK to an existing column is the documented rebuild pattern:
             // create the new table, copy data, drop the old one, rename into place.
+            //
+            // `tasks` is the FK parent of several child tables (dependencies, dod_items,
+            // evidence, verify_decisions, task_incidents). With foreign key enforcement
+            // on, `DROP TABLE tasks` fails with SQLITE_CONSTRAINT_FOREIGNKEY because it
+            // would leave those children pointing at a table that (briefly) doesn't
+            // exist. Foreign key enforcement is connection-scoped and can't be toggled
+            // inside a transaction, so it's flipped off for the rebuild and restored
+            // right after, with a `foreign_key_check` before re-enabling it to make sure
+            // the copy didn't actually drop any rows it shouldn't have.
+            self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
             self.conn.execute_batch(
                 "UPDATE tasks SET state = 'READY' WHERE state = 'Ready';
                  UPDATE tasks SET state = 'IN_PROGRESS' WHERE state = 'InProgress';
@@ -361,6 +371,18 @@ impl Store {
                  ALTER TABLE tasks_v6 RENAME TO tasks;
                  CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);",
             )?;
+            let dangling: i64 = self.conn.query_row(
+                "SELECT count(*) FROM pragma_foreign_key_check",
+                [],
+                |r| r.get(0),
+            )?;
+            if dangling > 0 {
+                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                return Err(AtlasError::InvalidState(format!(
+                    "v5->v6 migration left {dangling} dangling foreign key reference(s)"
+                )));
+            }
+            self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         }
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
