@@ -926,9 +926,33 @@ fn run_watch(
                             println!("📡 [{agent}] {ev_type} {state:?}: {summary}");
                         }
 
-                        // When an agent completes or a run finishes, trigger tick_once to promote ready tasks
-                        if ev_type == "run_finished" || state == Some("Success") {
-                            let _ = store.tick_once();
+                        // 2026-09-24 fix: `state == Some("Success")` alone used to trigger
+                        // tick_once() for ANY bus event with that state — including a plain
+                        // Claude Code "Stop" turn or an opencode "session.idle" that has
+                        // nothing to do with an Atlas-owned task. That promoted READY tasks
+                        // essentially at random whenever any agent finished any turn.
+                        //
+                        // Now the promotion pass only fires when the event explicitly
+                        // correlates to an Atlas task via `atlas_task_id` (checked at the
+                        // top level, inside `metadata`, or as a plain `task_id` fallback).
+                        // Events without that correlation are logged (above) but never
+                        // advance any task — this is what "cambia la fuente a eventos que
+                        // traigan atlas_task_id" means in practice: filter at the trigger,
+                        // not at the transport.
+                        let atlas_task_id = payload
+                            .get("atlas_task_id")
+                            .or_else(|| payload.get("metadata").and_then(|m| m.get("atlas_task_id")))
+                            .or_else(|| payload.get("metadata").and_then(|m| m.get("task_id")))
+                            .or_else(|| ev.get("atlas_task_id"))
+                            .and_then(|v| v.as_str());
+
+                        if let Some(task_id) = atlas_task_id {
+                            if ev_type == "run_finished" || state == Some("Success") {
+                                if !as_json {
+                                    println!("   ↳ atlas_task_id={task_id}: promoting");
+                                }
+                                let _ = store.tick_once();
+                            }
                         }
                     }
                 }
