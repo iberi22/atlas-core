@@ -163,6 +163,6 @@ pub fn get_projects_summary(store: &Store, session: Option<&str>) -> store::Resu
         });
     }
 
-    out.sort_by(|a, b| b.total_tasks.cmp(&a.total_tasks));
+    out.sort_by_key(|a| std::cmp::Reverse(a.total_tasks));
     Ok(out)
 }
