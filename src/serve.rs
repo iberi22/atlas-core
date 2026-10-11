@@ -123,12 +123,11 @@ fn fetch_gestalt_bus_events() -> Vec<serde_json::Value> {
     let mut resp = Vec::new();
     let _ = stream.read_to_end(&mut resp);
     let s = String::from_utf8_lossy(&resp);
-    if let Some((_, body)) = s.split_once("\r\n\r\n") {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-            if let Some(arr) = v.get("events").and_then(|e| e.as_array()) {
-                return arr.clone();
-            }
-        }
+    if let Some((_, body)) = s.split_once("\r\n\r\n")
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(arr) = v.get("events").and_then(|e| e.as_array())
+    {
+        return arr.clone();
     }
     Vec::new()
 }
@@ -257,12 +256,12 @@ fn handle_connection(mut stream: TcpStream, db: &Path) {
         return;
     }
     if path == "/api/projects" || path.starts_with("/api/projects?") {
-        if let Ok(store) = Store::open(db) {
-            if let Ok(projects) = crate::tree::get_projects_summary(&store, None) {
-                let json = serde_json::to_string(&projects).unwrap_or_else(|_| "[]".to_string());
-                respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-                return;
-            }
+        if let Ok(store) = Store::open(db)
+            && let Ok(projects) = crate::tree::get_projects_summary(&store, None)
+        {
+            let json = serde_json::to_string(&projects).unwrap_or_else(|_| "[]".to_string());
+            respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+            return;
         }
         respond(&mut stream, "500 Internal Error", "text/plain", b"store error");
         return;
@@ -319,25 +318,24 @@ fn handle_connection(mut stream: TcpStream, db: &Path) {
         return;
     }
     if path == "/api/task-detail" || path.starts_with("/api/task-detail?") {
-        if let Ok(store) = Store::open(db) {
-            if let Some(task_id) = extract_query_param(&path, "id") {
-                if let Ok(task) = store.get_task(&task_id) {
-                    let dod = store.dod_list(&task.id).unwrap_or_default();
-                    let evidence = store.evidence_list(&task.id).unwrap_or_default();
-                    let parents = store.parents_of(&task.id).unwrap_or_default();
-                    let children = store.children_of(&task.id).unwrap_or_default();
-                    let payload = serde_json::json!({
-                        "task": task,
-                        "dod_items": dod,
-                        "evidence": evidence,
-                        "parents": parents,
-                        "children": children,
-                    });
-                    let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-                    respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
-                    return;
-                }
-            }
+        if let Ok(store) = Store::open(db)
+            && let Some(task_id) = extract_query_param(&path, "id")
+            && let Ok(task) = store.get_task(&task_id)
+        {
+            let dod = store.dod_list(&task.id).unwrap_or_default();
+            let evidence = store.evidence_list(&task.id).unwrap_or_default();
+            let parents = store.parents_of(&task.id).unwrap_or_default();
+            let children = store.children_of(&task.id).unwrap_or_default();
+            let payload = serde_json::json!({
+                "task": task,
+                "dod_items": dod,
+                "evidence": evidence,
+                "parents": parents,
+                "children": children,
+            });
+            let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+            respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+            return;
         }
         respond(&mut stream, "404 Not Found", "text/plain", b"task not found");
         return;
@@ -1047,9 +1045,8 @@ mod tests {
         assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 101"));
         // El servidor cierra al no poder abrir la DB: trama close (0x88) o EOF.
         let mut hdr = [0u8; 2];
-        match client.read_exact(&mut hdr) {
-            Ok(()) => assert_eq!(hdr[0], 0x88, "close frame"),
-            Err(_) => {}
+        if let Ok(()) = client.read_exact(&mut hdr) {
+            assert_eq!(hdr[0], 0x88, "close frame");
         }
         h.join().expect("server thread");
     }

@@ -123,18 +123,18 @@ pub fn get_projects_summary(store: &Store, session: Option<&str>) -> store::Resu
 
     for t in &tasks {
         let mut proj = "GENERAL".to_string();
-        if let Some(start) = t.title.find('[') {
-            if let Some(end) = t.title[start..].find(']') {
-                let tag = &t.title[start + 1..start + end];
-                if !tag.is_empty() && !tag.starts_with("Ola") && !tag.starts_with("JULES") {
-                    proj = tag.to_uppercase();
-                }
+        if let Some(start) = t.title.find('[')
+            && let Some(end) = t.title[start..].find(']')
+        {
+            let tag = &t.title[start + 1..start + end];
+            if !tag.is_empty() && !tag.starts_with("Ola") && !tag.starts_with("JULES") {
+                proj = tag.to_uppercase();
             }
         }
-        if proj == "GENERAL" {
-            if let Some(dash) = t.id.find('-') {
-                proj = t.id[..dash].to_uppercase();
-            }
+        if proj == "GENERAL"
+            && let Some(dash) = t.id.find('-')
+        {
+            proj = t.id[..dash].to_uppercase();
         }
         map.entry(proj).or_default().push(t);
     }

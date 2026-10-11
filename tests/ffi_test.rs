@@ -17,15 +17,15 @@ fn test_ffi_slug_and_free() {
     assert!(!ptr.is_null());
     let slug = unsafe { CStr::from_ptr(ptr).to_str().unwrap() };
     assert_eq!(slug, "TSK_RUNNING");
-    atlas_free_string(ptr);
+    unsafe { atlas_free_string(ptr) };
 }
 
 #[test]
 fn test_ffi_exec_cabi() {
     let input = CString::new("{\"task_id\":\"TSK-01\"}").unwrap();
-    let res_ptr = atlas_exec_cabi(input.as_ptr());
+    let res_ptr = unsafe { atlas_exec_cabi(input.as_ptr()) };
     assert!(!res_ptr.is_null());
     let res_str = unsafe { CStr::from_ptr(res_ptr).to_str().unwrap() };
     assert!(res_str.contains("\"sodp_version\":\"4.0\""));
-    atlas_free_string(res_ptr);
+    unsafe { atlas_free_string(res_ptr) };
 }

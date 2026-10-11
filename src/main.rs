@@ -946,13 +946,13 @@ fn run_watch(
                             .or_else(|| ev.get("atlas_task_id"))
                             .and_then(|v| v.as_str());
 
-                        if let Some(task_id) = atlas_task_id {
-                            if ev_type == "run_finished" || state == Some("Success") {
-                                if !as_json {
-                                    println!("   ↳ atlas_task_id={task_id}: promoting");
-                                }
-                                let _ = store.tick_once();
+                        if let Some(task_id) = atlas_task_id
+                            && (ev_type == "run_finished" || state == Some("Success"))
+                        {
+                            if !as_json {
+                                println!("   ↳ atlas_task_id={task_id}: promoting");
                             }
+                            let _ = store.tick_once();
                         }
                     }
                 }

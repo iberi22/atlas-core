@@ -351,10 +351,10 @@ pub struct BacklogImportDraft {
 /// - bare array of task objects
 /// - object holding the array under `tasks`, `backlog`, `results`,
 ///   or `items`
-/// Per-item keys: `title` | `titulo` | `name`;
-/// `agent` | `agente` | `owner`;
-/// `depends_on` | `dependsOn` | `deps` | `depends-on` |
-/// `dependencies` | `dependencias`.
+///   Per-item keys: `title` | `titulo` | `name`;
+///   `agent` | `agente` | `owner`;
+///   `depends_on` | `dependsOn` | `deps` | `depends-on` |
+///   `dependencies` | `dependencias`.
 ///
 /// Validation: title must be non-empty after trimming; every dep must
 /// be an in-range index into the same list and never self-referential.
@@ -405,10 +405,10 @@ pub fn parse_external_backlog(text: &str) -> Result<Vec<ExternalBacklogItem>, Xa
 
 fn first_str(item: &serde_json::Value, keys: &[&str]) -> String {
     for key in keys {
-        if let Some(s) = item.get(*key).and_then(|v| v.as_str()) {
-            if !s.trim().is_empty() {
-                return s.to_owned();
-            }
+        if let Some(s) = item.get(*key).and_then(|v| v.as_str())
+            && !s.trim().is_empty()
+        {
+            return s.to_owned();
         }
     }
     String::new()

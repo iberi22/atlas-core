@@ -32,8 +32,11 @@ pub extern "C" fn atlas_status_slug(code: i64) -> *mut c_char {
 }
 
 /// Free a string returned by Atlas C-ABI exports.
+///
+/// # Safety
+/// `ptr` must be null or returned by an `atlas_*` C ABI function.
 #[unsafe(no_mangle)]
-pub extern "C" fn atlas_free_string(ptr: *mut c_char) {
+pub unsafe extern "C" fn atlas_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe {
             let _ = CString::from_raw(ptr);
@@ -42,8 +45,11 @@ pub extern "C" fn atlas_free_string(ptr: *mut c_char) {
 }
 
 /// Execute JSON-based FFI dispatch (Archetype SNP-903).
+///
+/// # Safety
+/// `json_input` must be null or a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
-pub extern "C" fn atlas_exec_cabi(json_input: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn atlas_exec_cabi(json_input: *const c_char) -> *mut c_char {
     if json_input.is_null() {
         return std::ptr::null_mut();
     }
