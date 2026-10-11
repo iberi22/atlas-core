@@ -77,3 +77,4 @@ tasks.json
 *.sqlite-shm
 *.profraw
 # <<< GITCORE PUBLIC REPO HARDENING <<<
+.backups/
