@@ -38,6 +38,16 @@ pre/post migration; the CHECK rejects invalid values). The branch is not
 merged yet, so the live DB is still `user_version = 5` with the data
 normalization applied out of band (all states now canonical uppercase).
 
+## Evaluating a session
+
+`atlas evaluate` runs an external evaluator script and fails if it fails. There is no default: set
+`ATLAS_EVALUATOR` to your evaluator (it receives `--db`, `--session` and optionally `--project`).
+`scripts/synthetic_evaluator.py` is only a test stub that always succeeds.
+
+```bash
+ATLAS_EVALUATOR=path/to/evaluator.py atlas evaluate --session <id>
+```
+
 ## Layout
 
 - `src/` — Rust core (future: dag, dispatcher, verifier, estimate, serve)

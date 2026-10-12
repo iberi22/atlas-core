@@ -398,8 +398,13 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             // Resolve the evaluator from $ATLAS_EVALUATOR or the working
             // directory. Never hardcode a machine-specific absolute path: this
             // repository is public.
-            let script = std::env::var("ATLAS_EVALUATOR")
-                .unwrap_or_else(|_| "scripts/synthetic_evaluator.py".to_string());
+            // No silent default: an evaluator that always passes would make
+            // `atlas evaluate` meaningless.
+            let script = std::env::var("ATLAS_EVALUATOR").map_err(|_| {
+                anyhow::anyhow!(
+                    "set ATLAS_EVALUATOR to the evaluator script (scripts/synthetic_evaluator.py is a test stub)"
+                )
+            })?;
             let mut cmd = std::process::Command::new("python3");
             cmd.arg(&script)
                .arg("--db").arg(&cli.db)
@@ -407,7 +412,7 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             if let Some(p) = project {
                 cmd.arg("--project").arg(p);
             }
-            let status = cmd.status().context("Failed to run atlas_xavier_evaluator.py")?;
+            let status = cmd.status().with_context(|| format!("Failed to run evaluator {script}"))?;
             if !status.success() {
                 bail!("Evaluator script failed with status {}", status);
             }
