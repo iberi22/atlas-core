@@ -13,19 +13,11 @@ is ready, what is blocked, and what counts as done.
 - Source of truth for progress: `.gitcore/features.json` (promoted only by
   green verification runs, never by hand).
 
-## Current state (live `atlas.db`, measured 2026-09-24)
+## Current state (Database)
 
-Row counts queried directly from the production SQLite store
-(`PRAGMA user_version = 5`):
+The repository provides scaffolding for the Atlas task store. It does not include a live database.
 
-- tasks: 900 (READY 736, COMPLETED 105, IN_PROGRESS 51, BLOCKED 7, FAILED 1)
-- edges: 765
-- dod_items: 2943
-- evidence: 1005
-- verify_decisions: 302
-
-(Counts move as the live DB evolves; re-query with
-`SELECT COUNT(*) FROM <table>` to refresh.)
+When running Atlas locally, an embedded SQLite database (`atlas.db`) will be created or used to store the task DAG, execution logs, and evaluation metrics.
 
 ## Task-state normalization migration (schema v5 -> v6)
 

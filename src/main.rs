@@ -399,7 +399,7 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             // directory. Never hardcode a machine-specific absolute path: this
             // repository is public.
             let script = std::env::var("ATLAS_EVALUATOR")
-                .unwrap_or_else(|_| "scripts/atlas_xavier_evaluator.py".to_string());
+                .unwrap_or_else(|_| "scripts/synthetic_evaluator.py".to_string());
             let mut cmd = std::process::Command::new("python3");
             cmd.arg(&script)
                .arg("--db").arg(&cli.db)
