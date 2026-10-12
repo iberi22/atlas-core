@@ -22,10 +22,5 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      # Kept non-blocking for now due to pre-existing lints:
-      # - clippy::not_unsafe_ptr_arg_deref
-      # - clippy::collapsible_if
-      # - clippy::doc_lazy_continuation
-      # - clippy::single_match
       - name: Run clippy
-        run: cargo clippy --all-targets || true
+        run: cargo clippy --all-targets -- -D warnings
