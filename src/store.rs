@@ -371,11 +371,11 @@ impl Store {
                  ALTER TABLE tasks_v6 RENAME TO tasks;
                  CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);",
             )?;
-            let dangling: i64 = self.conn.query_row(
-                "SELECT count(*) FROM pragma_foreign_key_check",
-                [],
-                |r| r.get(0),
-            )?;
+            let dangling: i64 =
+                self.conn
+                    .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                        r.get(0)
+                    })?;
             if dangling > 0 {
                 self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
                 return Err(AtlasError::InvalidState(format!(

@@ -6,7 +6,10 @@ use std::os::raw::c_char;
 /// Returns 1 if allowed, 0 if illegal or invalid code.
 #[unsafe(no_mangle)]
 pub extern "C" fn atlas_status_can_transition(from_code: i64, to_code: i64) -> i32 {
-    match (SwalStatusCode::from_code(from_code), SwalStatusCode::from_code(to_code)) {
+    match (
+        SwalStatusCode::from_code(from_code),
+        SwalStatusCode::from_code(to_code),
+    ) {
         (Some(from), Some(to)) if SwalStatusCode::can_transition(from, to) => 1,
         _ => 0,
     }

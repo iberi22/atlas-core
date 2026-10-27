@@ -3,10 +3,10 @@
 pub mod dag;
 mod error;
 pub mod estimator;
+pub mod ffi;
 pub mod forge;
 pub mod model;
 pub mod protocol;
-pub mod ffi;
 pub mod serve;
 pub mod store;
 pub mod tree;
@@ -19,5 +19,5 @@ pub use model::{
     TaskNode, TaskState, TickSummary, VerifyReport,
 };
 pub use store::{SCHEMA_VERSION, Store};
-pub use tree::{build_tree, matches_project, print_node, ProjectSummary};
+pub use tree::{ProjectSummary, build_tree, matches_project, print_node};
 pub use verifier::{CommandReviewer, ReviewDecision, Reviewer, StubReviewer};

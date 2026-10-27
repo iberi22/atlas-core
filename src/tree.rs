@@ -58,7 +58,10 @@ pub fn build_tree(
     for t in &tasks {
         let parents = store.parents_of(&t.id)?;
         // A task is a root in this view if it has no parents, or none of its parents are in `meta`
-        let local_parents: Vec<_> = parents.into_iter().filter(|p| meta.contains_key(&p.id)).collect();
+        let local_parents: Vec<_> = parents
+            .into_iter()
+            .filter(|p| meta.contains_key(&p.id))
+            .collect();
         if local_parents.is_empty() {
             roots.push(t.id.clone());
         } else {
@@ -117,7 +120,10 @@ pub fn print_node(n: &TaskNode, depth: usize) {
 }
 
 /// Scans tasks to compute project-level rollups and progress.
-pub fn get_projects_summary(store: &Store, session: Option<&str>) -> store::Result<Vec<ProjectSummary>> {
+pub fn get_projects_summary(
+    store: &Store,
+    session: Option<&str>,
+) -> store::Result<Vec<ProjectSummary>> {
     let tasks = store.list_tasks(session)?;
     let mut map: HashMap<String, Vec<&crate::model::Task>> = HashMap::new();
 
@@ -142,9 +148,18 @@ pub fn get_projects_summary(store: &Store, session: Option<&str>) -> store::Resu
     let mut out = Vec::with_capacity(map.len());
     for (name, pro_tasks) in map {
         let total = pro_tasks.len();
-        let completed = pro_tasks.iter().filter(|t| t.state == TaskState::Completed).count();
-        let ready = pro_tasks.iter().filter(|t| t.state == TaskState::Ready).count();
-        let in_prog = pro_tasks.iter().filter(|t| t.state == TaskState::InProgress).count();
+        let completed = pro_tasks
+            .iter()
+            .filter(|t| t.state == TaskState::Completed)
+            .count();
+        let ready = pro_tasks
+            .iter()
+            .filter(|t| t.state == TaskState::Ready)
+            .count();
+        let in_prog = pro_tasks
+            .iter()
+            .filter(|t| t.state == TaskState::InProgress)
+            .count();
         let blocked = total.saturating_sub(completed + ready + in_prog);
         let progress_pct = if total > 0 {
             (completed as f64 / total as f64) * 100.0
