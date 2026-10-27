@@ -1,5 +1,7 @@
 # Atlas Core
 
+[![CI](https://github.com/iberi22/atlas-core/actions/workflows/ci.yml/badge.svg)](https://github.com/iberi22/atlas-core/actions/workflows/ci.yml)
+
 Harness-agnostic long-horizon task orchestration for AI coding agents.
 Apache-2.0 open core of the Atlas system.
 
@@ -55,3 +57,7 @@ ATLAS_EVALUATOR=path/to/evaluator.py atlas evaluate --session <id>
 - `node/` — Node wrapper for shared hosting (future: Passenger-ready app.js)
 - `docs/` — BRD, user stories, SRS requirements, ADRs
 - `.gitcore/` — GitCore ledger (features, manifest, issues)
+
+## Security
+
+For security information and how to report vulnerabilities, please see our [Security Policy](SECURITY.md).

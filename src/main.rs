@@ -317,7 +317,11 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
                     }
                 }
                 if !cli.json {
-                    println!("🌱 Auto-drafted {} tasks grounded in Xavier into session {}", created_ids.len(), sess.id);
+                    println!(
+                        "🌱 Auto-drafted {} tasks grounded in Xavier into session {}",
+                        created_ids.len(),
+                        sess.id
+                    );
                 }
             }
             if cli.json {
@@ -380,7 +384,8 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
         }
         Cmd::Tree { session, project } => {
             let s = resolve_session(store, session)?;
-            let roots = atlas::tree::build_tree(store, &s, project.as_deref()).map_err(anyhow::Error::new)?;
+            let roots = atlas::tree::build_tree(store, &s, project.as_deref())
+                .map_err(anyhow::Error::new)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&roots)?);
             } else {
@@ -407,12 +412,16 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             })?;
             let mut cmd = std::process::Command::new("python3");
             cmd.arg(&script)
-               .arg("--db").arg(&cli.db)
-               .arg("--session").arg(&s);
+                .arg("--db")
+                .arg(&cli.db)
+                .arg("--session")
+                .arg(&s);
             if let Some(p) = project {
                 cmd.arg("--project").arg(p);
             }
-            let status = cmd.status().with_context(|| format!("Failed to run evaluator {script}"))?;
+            let status = cmd
+                .status()
+                .with_context(|| format!("Failed to run evaluator {script}"))?;
             if !status.success() {
                 bail!("Evaluator script failed with status {}", status);
             }
@@ -826,7 +835,11 @@ fn run(store: &Store, cli: &Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Xavier(sub) => run_xavier(sub, cli.json),
-        Cmd::Watch { bus, interval_ms, once } => run_watch(store, bus, *interval_ms, *once, cli.json),
+        Cmd::Watch {
+            bus,
+            interval_ms,
+            once,
+        } => run_watch(store, bus, *interval_ms, *once, cli.json),
     }
 }
 
@@ -860,7 +873,10 @@ fn run_watch(
             .unwrap_or(clean);
         let mut parts = without_proto.split(':');
         let host = parts.next().unwrap_or("127.0.0.1");
-        let port = parts.next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(8081);
+        let port = parts
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(8081);
 
         let addr_str = format!("{host}:{port}");
         let addrs: Vec<std::net::SocketAddr> = addr_str
@@ -916,7 +932,10 @@ fn run_watch(
                             .or_else(|| ev.get("agent_id").and_then(|a| a.as_str()))
                             .or_else(|| ev.get("agent").and_then(|a| a.as_str()))
                             .unwrap_or("unknown");
-                        let ev_type = ev.get("event_type").and_then(|t| t.as_str()).unwrap_or("event");
+                        let ev_type = ev
+                            .get("event_type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("event");
                         let summary = payload
                             .get("summary")
                             .and_then(|s| s.as_str())
@@ -946,7 +965,9 @@ fn run_watch(
                         // not at the transport.
                         let atlas_task_id = payload
                             .get("atlas_task_id")
-                            .or_else(|| payload.get("metadata").and_then(|m| m.get("atlas_task_id")))
+                            .or_else(|| {
+                                payload.get("metadata").and_then(|m| m.get("atlas_task_id"))
+                            })
                             .or_else(|| payload.get("metadata").and_then(|m| m.get("task_id")))
                             .or_else(|| ev.get("atlas_task_id"))
                             .and_then(|v| v.as_str());
@@ -1193,7 +1214,10 @@ mod tests {
 
         // Advance task A to in_progress
         store.run_task(&a).expect("run task A");
-        assert_eq!(store.get_task(&a).unwrap().state, model::TaskState::InProgress);
+        assert_eq!(
+            store.get_task(&a).unwrap().state,
+            model::TaskState::InProgress
+        );
 
         // Verifier gate: DoD + Evidence
         store.dod_add(&a, "done").expect("dod");
@@ -1206,6 +1230,9 @@ mod tests {
         // Simulating run_watch event trigger: executing tick_once
         let sum = store.tick_once().expect("tick once");
         assert_eq!(sum.processed, 4);
-        assert_eq!(store.get_task(&a).unwrap().state, model::TaskState::Completed);
+        assert_eq!(
+            store.get_task(&a).unwrap().state,
+            model::TaskState::Completed
+        );
     }
 }

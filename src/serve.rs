@@ -116,7 +116,8 @@ fn fetch_gestalt_bus_events() -> Vec<serde_json::Value> {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-    let req = "GET /api/events?limit=30 HTTP/1.1\r\nHost: 127.0.0.1:8081\r\nConnection: close\r\n\r\n";
+    let req =
+        "GET /api/events?limit=30 HTTP/1.1\r\nHost: 127.0.0.1:8081\r\nConnection: close\r\n\r\n";
     if stream.write_all(req.as_bytes()).is_err() {
         return Vec::new();
     }
@@ -138,7 +139,7 @@ pub fn snapshot_json(store: &Store) -> String {
     let tasks = store.list_tasks(None).unwrap_or_default();
     let events = store.recent_events(HISTORY_LIMIT).unwrap_or_default();
     let gestalt_events = fetch_gestalt_bus_events();
-    
+
     // Enrich tasks with DoD progress
     let enriched_tasks: Vec<serde_json::Value> = tasks
         .into_iter()
@@ -169,7 +170,8 @@ pub fn snapshot_json(store: &Store) -> String {
         "tasks": enriched_tasks,
         "events": events,
         "gestalt_events": gestalt_events
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// Serve forever on one listener; returns only on accept failure.
@@ -260,23 +262,48 @@ fn handle_connection(mut stream: TcpStream, db: &Path) {
             && let Ok(projects) = crate::tree::get_projects_summary(&store, None)
         {
             let json = serde_json::to_string(&projects).unwrap_or_else(|_| "[]".to_string());
-            respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.as_bytes(),
+            );
             return;
         }
-        respond(&mut stream, "500 Internal Error", "text/plain", b"store error");
+        respond(
+            &mut stream,
+            "500 Internal Error",
+            "text/plain",
+            b"store error",
+        );
         return;
     }
     if path == "/api/tree" || path.starts_with("/api/tree?") {
         if let Ok(store) = Store::open(db) {
-            let session = store.latest_session().ok().flatten().map(|s| s.id).unwrap_or_else(|| "default".to_string());
+            let session = store
+                .latest_session()
+                .ok()
+                .flatten()
+                .map(|s| s.id)
+                .unwrap_or_else(|| "default".to_string());
             let proj = extract_query_param(&path, "project");
             if let Ok(tree) = crate::tree::build_tree(&store, &session, proj.as_deref()) {
                 let json = serde_json::to_string(&tree).unwrap_or_else(|_| "[]".to_string());
-                respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    json.as_bytes(),
+                );
                 return;
             }
         }
-        respond(&mut stream, "500 Internal Error", "text/plain", b"store error");
+        respond(
+            &mut stream,
+            "500 Internal Error",
+            "text/plain",
+            b"store error",
+        );
         return;
     }
     if path == "/api/tasks" || path.starts_with("/api/tasks?") {
@@ -284,7 +311,10 @@ fn handle_connection(mut stream: TcpStream, db: &Path) {
             let proj = extract_query_param(&path, "project");
             let tasks = store.list_tasks(None).unwrap_or_default();
             let filtered: Vec<_> = if let Some(ref p) = proj {
-                tasks.into_iter().filter(|t| crate::tree::matches_project(&t.title, &t.id, p)).collect()
+                tasks
+                    .into_iter()
+                    .filter(|t| crate::tree::matches_project(&t.title, &t.id, p))
+                    .collect()
             } else {
                 tasks
             };
@@ -311,10 +341,20 @@ fn handle_connection(mut stream: TcpStream, db: &Path) {
                 })
                 .collect();
             let json = serde_json::to_string(&enriched).unwrap_or_else(|_| "[]".to_string());
-            respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.as_bytes(),
+            );
             return;
         }
-        respond(&mut stream, "500 Internal Error", "text/plain", b"store error");
+        respond(
+            &mut stream,
+            "500 Internal Error",
+            "text/plain",
+            b"store error",
+        );
         return;
     }
     if path == "/api/task-detail" || path.starts_with("/api/task-detail?") {
@@ -334,25 +374,53 @@ fn handle_connection(mut stream: TcpStream, db: &Path) {
                 "children": children,
             });
             let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-            respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.as_bytes(),
+            );
             return;
         }
-        respond(&mut stream, "404 Not Found", "text/plain", b"task not found");
+        respond(
+            &mut stream,
+            "404 Not Found",
+            "text/plain",
+            b"task not found",
+        );
         return;
     }
     if path == "/api/llm-context" || path.starts_with("/api/llm-context?") {
         if let Ok(store) = Store::open(db) {
-            let session = store.latest_session().ok().flatten().map(|s| s.id).unwrap_or_else(|| "default".to_string());
-            let proj = extract_query_param(&path, "project").unwrap_or_else(|| "ATLAS-CORE".to_string());
+            let session = store
+                .latest_session()
+                .ok()
+                .flatten()
+                .map(|s| s.id)
+                .unwrap_or_else(|| "default".to_string());
+            let proj =
+                extract_query_param(&path, "project").unwrap_or_else(|| "ATLAS-CORE".to_string());
             let tree = crate::tree::build_tree(&store, &session, Some(&proj)).unwrap_or_default();
             let tasks = store.list_tasks(Some(&session)).unwrap_or_default();
-            let proj_tasks: Vec<_> = tasks.into_iter().filter(|t| crate::tree::matches_project(&t.title, &t.id, &proj)).collect();
+            let proj_tasks: Vec<_> = tasks
+                .into_iter()
+                .filter(|t| crate::tree::matches_project(&t.title, &t.id, &proj))
+                .collect();
             let total = proj_tasks.len();
-            let completed = proj_tasks.iter().filter(|t| t.state == crate::model::TaskState::Completed).count();
-            let ready = proj_tasks.iter().filter(|t| t.state == crate::model::TaskState::Ready).count();
-            let in_prog = proj_tasks.iter().filter(|t| t.state == crate::model::TaskState::InProgress).count();
+            let completed = proj_tasks
+                .iter()
+                .filter(|t| t.state == crate::model::TaskState::Completed)
+                .count();
+            let ready = proj_tasks
+                .iter()
+                .filter(|t| t.state == crate::model::TaskState::Ready)
+                .count();
+            let in_prog = proj_tasks
+                .iter()
+                .filter(|t| t.state == crate::model::TaskState::InProgress)
+                .count();
             let blocked = total.saturating_sub(completed + ready + in_prog);
-            
+
             let payload = serde_json::json!({
                 "project": proj.to_uppercase(),
                 "session": session,
@@ -368,10 +436,20 @@ fn handle_connection(mut stream: TcpStream, db: &Path) {
                 "instructions_for_llm": "Focus on READY tasks whose upstream dependencies are completed. Update state via atlas run / complete."
             });
             let json = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
-            respond(&mut stream, "200 OK", "application/json; charset=utf-8", json.as_bytes());
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.as_bytes(),
+            );
             return;
         }
-        respond(&mut stream, "500 Internal Error", "text/plain", b"store error");
+        respond(
+            &mut stream,
+            "500 Internal Error",
+            "text/plain",
+            b"store error",
+        );
         return;
     }
     respond(&mut stream, "404 Not Found", "text/plain", b"not found");
@@ -510,10 +588,7 @@ mod tests {
 
     fn temp_db(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "atlas_serve_{tag}_{}.db",
-            std::process::id()
-        ));
+        p.push(format!("atlas_serve_{tag}_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -655,19 +730,26 @@ mod tests {
     #[test]
     fn snapshot_has_sodp_envelope_and_empty_lists() {
         let store = Store::open_in_memory().expect("open");
-        let snap: serde_json::Value =
-            serde_json::from_str(&snapshot_json(&store)).expect("JSON");
+        let snap: serde_json::Value = serde_json::from_str(&snapshot_json(&store)).expect("JSON");
         assert_eq!(
             snap.get("sodp_protocol").expect("sodp").as_str(),
             Some("4.0")
         );
         assert!(snap.get("schema_version").is_some());
         assert_eq!(
-            snap.get("tasks").expect("tasks").as_array().expect("arr").len(),
+            snap.get("tasks")
+                .expect("tasks")
+                .as_array()
+                .expect("arr")
+                .len(),
             0
         );
         assert_eq!(
-            snap.get("events").expect("events").as_array().expect("arr").len(),
+            snap.get("events")
+                .expect("events")
+                .as_array()
+                .expect("arr")
+                .len(),
             0
         );
     }
@@ -680,8 +762,7 @@ mod tests {
                 .record_event("probe", &format!("{{\"i\":{i}}}"))
                 .expect("event");
         }
-        let snap: serde_json::Value =
-            serde_json::from_str(&snapshot_json(&store)).expect("JSON");
+        let snap: serde_json::Value = serde_json::from_str(&snapshot_json(&store)).expect("JSON");
         let events = snap
             .get("events")
             .expect("events")
@@ -714,9 +795,7 @@ mod tests {
     #[test]
     fn read_head_rejects_oversized_head() {
         let (mut client, mut server) = tcp_pair();
-        client
-            .write_all(&vec![b'A'; 20 * 1024])
-            .expect("write");
+        client.write_all(&vec![b'A'; 20 * 1024]).expect("write");
         client
             .shutdown(std::net::Shutdown::Write)
             .expect("shutdown");
